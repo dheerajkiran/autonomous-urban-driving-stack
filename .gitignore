@@ -1,0 +1,45 @@
+# ROS2 workspace build artifacts
+build/
+install/
+log/
+*.devel/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter (future)
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment / secrets
+.env
+.env.*
+*.env.local
+
+# PyTorch / model artifacts (future)
+*.pt
+*.pth
+*.onnx
+
+# CARLA (future)
+CarlaUE4/
+
+# Coverage
+.coverage
+htmlcov/
