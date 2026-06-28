@@ -1,0 +1,23 @@
+# Vehicle State Package Parameters
+# These values are loaded by the launch file and passed to each node.
+# Override at launch time with: ros2 launch ads_vehicle_state vehicle_state.launch.py
+# or at runtime via: ros2 param set /vehicle_state_publisher target_speed 15.0
+
+vehicle_state_publisher:
+  ros__parameters:
+    # Publishing
+    publish_rate: 20.0          # [Hz]  State broadcast frequency
+    topic_name: /vehicle/state
+    frame_id: base_link
+
+    # Simulated vehicle dynamics
+    target_speed: 10.0          # [m/s]  Desired cruising speed (~36 km/h)
+    acceleration_rate: 1.5      # [m/s²] Constant longitudinal acceleration during spin-up
+
+    # Sensor noise model (Gaussian)
+    noise_stddev: 0.05          # [m/s]  Std-dev of speed measurement noise
+
+vehicle_state_monitor:
+  ros__parameters:
+    topic_name: /vehicle/state
+    log_interval: 2.0           # [s]  Interval between rolling-summary log lines
