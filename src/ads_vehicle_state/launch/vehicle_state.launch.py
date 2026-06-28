@@ -1,9 +1,13 @@
 """
 Vehicle State Launch File
 
-Brings up the vehicle state layer of the ADS pipeline:
-  - vehicle_state_publisher : kinematic simulator → /vehicle/state
+Brings up the full vehicle state layer for Phase 2:
+  - vehicle_commander     : scripted mission publisher → /vehicle/command
+  - vehicle_state_publisher : kinematic bicycle-model plant → /vehicle/state
   - vehicle_state_monitor   : passive diagnostic observer
+
+Topic flow:
+  vehicle_commander → /vehicle/command → vehicle_state_publisher → /vehicle/state → vehicle_state_monitor
 
 Usage
 -----
@@ -32,6 +36,16 @@ def generate_launch_description() -> LaunchDescription:
     )
     log_level = LaunchConfiguration("log_level")
 
+    commander_node = Node(
+        package="ads_vehicle_state",
+        executable="vehicle_commander",
+        name="vehicle_commander",
+        parameters=[config_path],
+        arguments=["--ros-args", "--log-level", log_level],
+        output="screen",
+        emulate_tty=True,
+    )
+
     publisher_node = Node(
         package="ads_vehicle_state",
         executable="vehicle_state_publisher",
@@ -54,7 +68,8 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription([
         log_level_arg,
-        LogInfo(msg=["[ADS] Launching vehicle state layer — log_level=", log_level]),
+        LogInfo(msg=["[ADS] Launching vehicle state layer (Phase 2) — log_level=", log_level]),
+        commander_node,
         publisher_node,
         monitor_node,
     ])

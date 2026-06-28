@@ -155,7 +155,8 @@ def main(args: Optional[list] = None) -> None:
         node.get_logger().info("Shutdown requested — stopping VehicleStateMonitor.")
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

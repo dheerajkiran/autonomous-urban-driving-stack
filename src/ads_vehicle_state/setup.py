@@ -24,6 +24,7 @@ setup(
         "console_scripts": [
             "vehicle_state_publisher = ads_vehicle_state.vehicle_state_publisher:main",
             "vehicle_state_monitor = ads_vehicle_state.vehicle_state_monitor:main",
+            "vehicle_commander = ads_vehicle_state.vehicle_commander:main",
         ],
     },
 )
