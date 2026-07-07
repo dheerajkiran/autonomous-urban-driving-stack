@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SUMO GUI View Settings — ADS Dark Theme
+  Loaded automatically by sumo_bridge via the .sumocfg file.
+  Gives the simulation a Waymo/AV-dashboard aesthetic:
+    - Dark background
+    - High-contrast road colors by type
+    - Colored vehicle types
+    - Buildings and parks rendered from OSM polygons
+-->
+<viewsettings>
+
+    <!-- ── Background ──────────────────────────────────────────── -->
+    <scheme name="ads_dark">
+        <background backgroundColor="20,20,30,255"
+                     showGrid="0"
+                     gridXSize="100"
+                     gridYSize="100"/>
+
+        <!-- ── Roads ───────────────────────────────────────────── -->
+        <edges laneEdgeMode="0"
+               laneShowBorders="1"
+               laneWidthExaggeration="1"
+               edgeValueHideCheck="0"
+               edgeValueHideThreshold="0.01"
+               showLaneBorders="1"
+               showLaneDecals="1"
+               showRails="1"
+               showEdgeName="0"
+               showStreetName="0"
+               streetNameSize="50"
+               edgeParam="">
+            <!-- motorway / highway -->
+            <colorScheme name="uniform">
+                <entry color="80,80,100,255"/>
+            </colorScheme>
+        </edges>
+
+        <!-- ── Junctions ────────────────────────────────────────── -->
+        <junctions junctionMode="0"
+                   drawLinkRules="1"
+                   drawLinks="0"
+                   showLane2LaneConnections="0"
+                   showJunctionIndex="0"
+                   showJunctionName="0"
+                   junctionSize="2">
+            <colorScheme name="uniform">
+                <entry color="60,60,75,255"/>
+            </colorScheme>
+        </junctions>
+
+        <!-- ── Vehicles ─────────────────────────────────────────── -->
+        <vehicles vehicleMode="9"
+                  vehicleQuality="2"
+                  minVehicleSize="1"
+                  vehicleExaggeration="1.2"
+                  showBlinker="1"
+                  vehicleColorInterpolation="0"
+                  showMinGap="0"
+                  showBTRange="0"
+                  showRouteIndex="0"
+                  scaleLength="1"
+                  drawLaneChangePreference="0"
+                  drawReversed="0"
+                  showParkingInfo="0">
+            <colorScheme name="given/assigned vehicle color">
+                <!-- Default vehicle color when not individually assigned -->
+                <entry color="180,180,180,255"/>
+            </colorScheme>
+        </vehicles>
+
+        <!-- ── Polygons (buildings, parks, water) ───────────────── -->
+        <polys polyMode="0"
+               showPolygonName="0"
+               polygonNameSize="50"
+               polyExaggeration="1"
+               showInnerPolygons="1"
+               allowOffscreen="1"/>
+
+        <!-- ── POIs ─────────────────────────────────────────────── -->
+        <pois poiMode="0"
+              showPOIName="0"
+              poiNameSize="50"
+              poiExaggeration="1"
+              showPOIIcon="0"
+              poiIconSize="3"/>
+
+        <!-- ── Miscellaneous ─────────────────────────────────────── -->
+        <legend showSizeLegend="0"
+                showColorLegend="0"
+                showParameterLegend="1"/>
+
+    </scheme>
+
+    <delay value="20"/>
+    <viewport x="0" y="0" zoom="200" angle="0"/>
+    <current_scheme value="ads_dark"/>
+
+</viewsettings>

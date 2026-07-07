@@ -59,8 +59,10 @@ class MapLoader(Node):
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._graphml_path = self._cache_dir / "tempe_drive.graphml"
-        self._osm_path = self._cache_dir / "tempe.osm"
-        self._net_path = self._cache_dir / "tempe.net.xml"
+        self._osm_path     = self._cache_dir / "tempe.osm"
+        self._net_path     = self._cache_dir / "tempe.net.xml"
+        self._poly_path    = self._cache_dir / "tempe.poly.xml"
+        self._cfg_path     = self._cache_dir / "tempe.sumocfg"
 
         self._status_pub = self.create_publisher(String, "/map/status", 10)
 
@@ -84,8 +86,10 @@ class MapLoader(Node):
         try:
             self._ensure_graph()
             self._ensure_sumo_network()
+            self._ensure_poly_file()
+            self._ensure_sumo_config()
             self._publish_status(self._STATUS_READY)
-            self.get_logger().info("Map ready — road network and SUMO network available.")
+            self.get_logger().info("Map ready — road network, polygons, and SUMO config available.")
         except Exception as exc:
             self.get_logger().error(f"Map loading failed: {exc}")
             self._publish_status(self._STATUS_ERROR)
@@ -183,6 +187,81 @@ class MapLoader(Node):
         self.get_logger().info(f"SUMO network generated — '{self._net_path}'")
 
     # ------------------------------------------------------------------
+    # OSM polygons (buildings, parks, water bodies)
+    # ------------------------------------------------------------------
+
+    def _ensure_poly_file(self) -> None:
+        if self._poly_path.exists() and not self._force_reload:
+            self.get_logger().info(f"Polygon cache found — '{self._poly_path}'")
+            return
+
+        if not self._osm_path.exists():
+            self.get_logger().warn("OSM file missing — skipping polygon generation.")
+            return
+
+        self.get_logger().info("Generating building/park/water polygons with polyconvert...")
+
+        result = subprocess.run(
+            [
+                "polyconvert",
+                "--net-file",    str(self._net_path),
+                "--osm-files",   str(self._osm_path),
+                "--output-file", str(self._poly_path),
+                "--osm.keep-full-type",
+                "--type-file",   "/usr/share/sumo/data/typemap/osmPolyconvert.typ.xml",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        if result.returncode != 0:
+            # Polygon file is optional — log warning but don't fail the whole map load.
+            self.get_logger().warn(
+                f"polyconvert exited with code {result.returncode} — "
+                "simulation will run without building polygons.\n"
+                f"{result.stderr[-300:]}"
+            )
+        else:
+            self.get_logger().info(f"Polygon file generated — '{self._poly_path}'")
+
+    # ------------------------------------------------------------------
+    # SUMO config file (.sumocfg)
+    # ------------------------------------------------------------------
+
+    def _ensure_sumo_config(self) -> None:
+        if self._cfg_path.exists() and not self._force_reload:
+            self.get_logger().info(f"SUMO config cache found — '{self._cfg_path}'")
+            return
+
+        additional = str(self._poly_path) if self._poly_path.exists() else ""
+
+        cfg_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+    <input>
+        <net-file value="{self._net_path}"/>
+        {"<additional-files value=" + chr(34) + additional + chr(34) + "/>" if additional else "<!-- no polygon file -->"}
+    </input>
+    <time>
+        <step-length value="0.05"/>
+        <begin value="0"/>
+    </time>
+    <processing>
+        <collision.action value="warn"/>
+        <time-to-teleport value="60"/>
+        <waiting-time-memory value="100"/>
+    </processing>
+    <report>
+        <no-step-log value="true"/>
+        <no-warnings value="true"/>
+        <verbose value="false"/>
+    </report>
+</configuration>
+"""
+        self._cfg_path.write_text(cfg_xml)
+        self.get_logger().info(f"SUMO config written — '{self._cfg_path}'")
+
+    # ------------------------------------------------------------------
     # Public accessors (used by other nodes in the same process or via service)
     # ------------------------------------------------------------------
 
@@ -193,6 +272,10 @@ class MapLoader(Node):
     @property
     def net_path(self) -> Path:
         return self._net_path
+
+    @property
+    def cfg_path(self) -> Path:
+        return self._cfg_path
 
     @property
     def cache_dir(self) -> Path:

@@ -70,15 +70,17 @@ class SumoBridge(Node):
 
         self.declare_parameter("cache_dir", str(Path.home() / "ads_map_cache"))
         self.declare_parameter("net_filename", "tempe.net.xml")
-        self.declare_parameter("step_length", 0.05)        # simulation seconds per step
-        self.declare_parameter("publish_rate", 20.0)       # Hz
+        self.declare_parameter("cfg_filename", "tempe.sumocfg")
+        self.declare_parameter("step_length", 0.05)
+        self.declare_parameter("publish_rate", 20.0)
         self.declare_parameter("detection_radius_m", 80.0)
-        self.declare_parameter("use_gui", True)            # sumo-gui vs sumo
-        self.declare_parameter("ego_depart_speed", 0.0)    # m/s at spawn
+        self.declare_parameter("use_gui", True)
+        self.declare_parameter("ego_depart_speed", 0.0)
         self.declare_parameter("max_vehicles", 100)
 
         self._cache_dir = Path(self.get_parameter("cache_dir").value)
         self._net_filename = self.get_parameter("net_filename").value
+        self._cfg_filename = self.get_parameter("cfg_filename").value
         self._step_length = self.get_parameter("step_length").value
         self._publish_rate = self.get_parameter("publish_rate").value
         self._detection_radius = self.get_parameter("detection_radius_m").value
@@ -86,6 +88,7 @@ class SumoBridge(Node):
         self._max_vehicles = self.get_parameter("max_vehicles").value
 
         self._net_path = self._cache_dir / self._net_filename
+        self._cfg_path = self._cache_dir / self._cfg_filename
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -153,24 +156,42 @@ class SumoBridge(Node):
 
         sumo_binary = "sumo-gui" if self._use_gui else "sumo"
 
-        sumo_cmd = [
-            sumo_binary,
-            "--net-file", str(self._net_path),
-            "--no-step-log",
-            "--no-warnings",
-            "--collision.action", "warn",
-            "--step-length", str(self._step_length),
-            "--time-to-teleport", "60",
-            "--waiting-time-memory", "100",
-        ]
+        # Prefer the .sumocfg (includes polygons + settings). Fall back to --net-file.
+        use_cfg = self._cfg_path.exists()
+        if use_cfg:
+            base_args = [sumo_binary, "-c", str(self._cfg_path)]
+        else:
+            self.get_logger().warn(
+                "sumocfg not found — starting SUMO with net-file only (no polygons)."
+            )
+            base_args = [sumo_binary, "--net-file", str(self._net_path)]
 
-        self.get_logger().info(f"Starting SUMO: {' '.join(sumo_cmd[:2])} ...")
+        # Attach viewsettings if available (dark theme, AV-style colors).
+        viewsettings_path = Path(__file__).parent.parent / "config" / "viewsettings.xml"
+        if not viewsettings_path.exists():
+            # Try installed share path.
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                share = get_package_share_directory("ads_simulation")
+                viewsettings_path = Path(share) / "config" / "viewsettings.xml"
+            except Exception:
+                pass
+
+        sumo_cmd = base_args + ["--no-step-log", "--no-warnings"]
+        if self._use_gui and viewsettings_path.exists():
+            sumo_cmd += ["--gui-settings-file", str(viewsettings_path)]
+            self.get_logger().info(f"Viewsettings loaded: '{viewsettings_path}'")
+
+        self.get_logger().info(f"Starting {sumo_binary} ...")
 
         try:
             traci.start(sumo_cmd)
             self._sumo_running = True
             self._publish_status("RUNNING")
-            self.get_logger().info("SUMO started successfully.")
+            self.get_logger().info(
+                f"SUMO started — cfg={'yes' if use_cfg else 'no'}, "
+                f"gui={self._use_gui}"
+            )
         except Exception as exc:
             self.get_logger().error(f"Failed to start SUMO: {exc}")
             self._publish_status("ERROR")
