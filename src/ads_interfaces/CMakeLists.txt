@@ -12,6 +12,10 @@ find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/VehicleState.msg"
   "msg/VehicleCommand.msg"
+  "msg/Waypoint.msg"
+  "msg/Route.msg"
+  "msg/TrafficVehicle.msg"
+  "msg/TrafficVehicleArray.msg"
   DEPENDENCIES std_msgs
 )
 
