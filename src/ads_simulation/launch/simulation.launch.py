@@ -50,7 +50,6 @@ def generate_launch_description() -> LaunchDescription:
         arguments=["--ros-args", "--log-level", log_level],
         output="screen",
         emulate_tty=True,
-        stdin="screen",
     )
 
     sumo_bridge = Node(

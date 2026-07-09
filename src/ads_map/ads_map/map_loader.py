@@ -51,7 +51,7 @@ class MapLoader(Node):
         self.declare_parameter("network_type", "drive")
         self.declare_parameter("force_reload", False)
 
-        self._cache_dir = Path(self.get_parameter("cache_dir").value)
+        self._cache_dir = Path(self.get_parameter("cache_dir").value).expanduser()
         self._city_query = self.get_parameter("city_query").value
         self._network_type = self.get_parameter("network_type").value
         self._force_reload = self.get_parameter("force_reload").value

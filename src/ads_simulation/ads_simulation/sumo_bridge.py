@@ -78,7 +78,7 @@ class SumoBridge(Node):
         self.declare_parameter("ego_depart_speed", 0.0)
         self.declare_parameter("max_vehicles", 100)
 
-        self._cache_dir = Path(self.get_parameter("cache_dir").value)
+        self._cache_dir = Path(self.get_parameter("cache_dir").value).expanduser()
         self._net_filename = self.get_parameter("net_filename").value
         self._cfg_filename = self.get_parameter("cfg_filename").value
         self._step_length = self.get_parameter("step_length").value

@@ -8,7 +8,7 @@ sumo_bridge:
     step_length: 0.05                   # SUMO simulation step [s] (20 steps/s)
     publish_rate: 20.0                  # ROS2 publish rate [Hz]
     detection_radius_m: 80.0            # Nearby vehicle detection radius [m]
-    use_gui: true                       # true = sumo-gui (visual), false = headless
+    use_gui: false                      # sumo-gui not available on ARM64 — using custom Pygame viewer
     ego_depart_speed: 0.0               # Ego spawn speed [m/s]
     max_vehicles: 100
 

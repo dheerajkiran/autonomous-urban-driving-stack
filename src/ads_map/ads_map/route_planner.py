@@ -51,7 +51,7 @@ class RoutePlanner(Node):
         self.declare_parameter("default_speed_kph", 50.0)
         self.declare_parameter("waypoint_spacing_m", 30.0)
 
-        self._cache_dir = Path(self.get_parameter("cache_dir").value)
+        self._cache_dir = Path(self.get_parameter("cache_dir").value).expanduser()
         self._graphml_filename = self.get_parameter("graphml_filename").value
         self._default_speed_kph = self.get_parameter("default_speed_kph").value
         self._waypoint_spacing_m = self.get_parameter("waypoint_spacing_m").value
