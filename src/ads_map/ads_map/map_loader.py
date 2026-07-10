@@ -105,7 +105,8 @@ class MapLoader(Node):
     # ------------------------------------------------------------------
 
     def _ensure_graph(self) -> None:
-        if self._graphml_path.exists() and not self._force_reload:
+        both_cached = self._graphml_path.exists() and self._osm_path.exists()
+        if both_cached and not self._force_reload:
             self.get_logger().info(
                 f"OSM graph cache found — loading from '{self._graphml_path}'"
             )
@@ -125,18 +126,22 @@ class MapLoader(Node):
         ox.settings.log_console = False
         ox.settings.use_cache = True
 
-        G = ox.graph_from_place(self._city_query, network_type=self._network_type)
-
-        # Save GraphML for route_planner reuse.
-        ox.save_graphml(G, filepath=str(self._graphml_path))
-
-        # Save raw OSM XML for netconvert.
-        ox.save_graph_xml(G, filepath=str(self._osm_path))
-
-        node_count = len(G.nodes)
-        edge_count = len(G.edges)
+        # Download unsimplified — required for OSM XML export (netconvert/SUMO).
+        self.get_logger().info("Downloading unsimplified graph for SUMO network generation...")
+        G_raw = ox.graph_from_place(
+            self._city_query, network_type=self._network_type, simplify=False
+        )
+        ox.save_graph_xml(G_raw, filepath=str(self._osm_path))
         self.get_logger().info(
-            f"OSM graph downloaded — {node_count:,} nodes, {edge_count:,} edges"
+            f"Raw OSM XML saved — {len(G_raw.nodes):,} nodes, {len(G_raw.edges):,} edges"
+        )
+
+        # Simplify for efficient A* route planning and save as GraphML.
+        self.get_logger().info("Simplifying graph for route planning...")
+        G = ox.simplify_graph(G_raw)
+        ox.save_graphml(G, filepath=str(self._graphml_path))
+        self.get_logger().info(
+            f"Simplified graph saved — {len(G.nodes):,} nodes, {len(G.edges):,} edges"
         )
 
     # ------------------------------------------------------------------
