@@ -125,7 +125,7 @@ Terminal Input (start address → destination)
 sudo apt install -y sumo sumo-tools sumo-gui
 
 # Python dependencies
-pip install osmnx numpy
+pip install osmnx "numpy<2" scikit-learn traci
 ```
 
 ### Build
@@ -140,18 +140,27 @@ source install/setup.bash
 ### Run — Full Stack
 
 ```bash
-ros2 launch launch/ads_full.launch.py
+# Headless (recommended — works on all platforms including ARM64)
+ros2 launch launch/ads_full.launch.py use_gui:=false
+
+# With SUMO GUI (x86 Linux only)
+ros2 launch launch/ads_full.launch.py use_gui:=true
 ```
 
-You will be prompted in the terminal:
+Once the stack is running, publish a mission goal from a second terminal:
 
-```
-  Start address  : Arizona State University, Tempe, AZ
-  Destination    : Tempe Marketplace, Tempe, AZ
+```bash
+ros2 topic pub /navigation/mission_goal std_msgs/msg/String \
+  "{data: '{\"start\": \"Arizona State University, Tempe, AZ\", \"end\": \"Tempe Town Lake, Tempe, AZ\"}'}" \
+  --once
 ```
 
-The SUMO GUI opens showing the Tempe road network. The ego vehicle (cyan)
-navigates through live traffic from your start to destination.
+Verify the simulation is running:
+
+```bash
+ros2 topic echo /vehicle/state --once        # ego position + speed
+ros2 topic echo /simulation/traffic_count    # background vehicle count
+```
 
 ### Run — Vehicle State Layer Only (no SUMO)
 
