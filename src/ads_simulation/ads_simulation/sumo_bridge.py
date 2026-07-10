@@ -2,8 +2,8 @@
 SUMO Bridge Node
 
 The core simulation-ROS2 integration layer. Manages the SUMO process lifecycle,
-controls the ego vehicle inside the simulation, and bridges SUMO state to ROS2
-topics at each simulation step.
+controls the ego vehicle, spawns background traffic, and bridges SUMO state to
+ROS2 topics at each simulation step.
 
 At each tick:
   1. Steps the SUMO simulation forward by one timestep.
@@ -12,10 +12,7 @@ At each tick:
   4. Reads all nearby vehicles from SUMO (within detection_radius_m).
   5. Publishes them as TrafficVehicleArray on /perception/traffic_vehicles.
   6. Reads the latest VehicleCommand and applies speed/lane changes to SUMO.
-
-The ego vehicle follows the SUMO-internal route set via TraCI's
-changeTarget() — destination is updated whenever a new Route is received
-from /navigation/route.
+  7. Tops up background traffic to the target vehicle count.
 
 Subscribes
 ----------
@@ -27,12 +24,12 @@ Publishes
 /vehicle/state             (ads_interfaces/msg/VehicleState)
 /perception/traffic_vehicles  (ads_interfaces/msg/TrafficVehicleArray)
 /simulation/status         (std_msgs/String)
+/simulation/traffic_count  (std_msgs/String)
 """
 
 import math
-import os
-import subprocess
-import time
+import random
+import string
 from pathlib import Path
 from typing import Optional
 
@@ -52,17 +49,47 @@ from ads_interfaces.msg import (
 _EGO_ID = "ego"
 _EGO_TYPE = "passenger"
 
+_BG_VEHICLE_TYPES = [
+    ("car", 0.65),
+    ("van", 0.15),
+    ("truck", 0.10),
+    ("bus", 0.05),
+    ("moto", 0.05),
+]
+
+_BG_COLORS = [
+    (200, 200, 200, 255),
+    (180, 0,   0,   255),
+    (0,   0,   180, 255),
+    (0,   140, 0,   255),
+    (230, 180, 0,   255),
+    (100, 100, 100, 255),
+    (255, 140, 0,   255),
+]
+
+
+def _weighted_choice(choices):
+    r = random.random()
+    cumulative = 0.0
+    for v, w in choices:
+        cumulative += w
+        if r <= cumulative:
+            return v
+    return choices[-1][0]
+
+
+def _rand_id():
+    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return f"bg_{suffix}"
+
 
 class SumoBridge(Node):
     """
     Bridges SUMO simulation state to the ROS2 autonomy stack.
 
     Starts SUMO (or sumo-gui for visualization), inserts the ego vehicle,
-    and runs a fixed-rate loop that steps the simulation and exchanges
-    state/command data with the rest of the stack.
-
-    The node waits for /map/status == "READY" before starting SUMO so that
-    the network file is guaranteed to exist.
+    maintains background traffic, and runs a fixed-rate loop that steps the
+    simulation and exchanges state/command data with the rest of the stack.
     """
 
     def __init__(self) -> None:
@@ -76,7 +103,7 @@ class SumoBridge(Node):
         self.declare_parameter("detection_radius_m", 80.0)
         self.declare_parameter("use_gui", True)
         self.declare_parameter("ego_depart_speed", 0.0)
-        self.declare_parameter("max_vehicles", 100)
+        self.declare_parameter("target_vehicle_count", 60)
 
         self._cache_dir = Path(self.get_parameter("cache_dir").value).expanduser()
         self._net_filename = self.get_parameter("net_filename").value
@@ -85,7 +112,7 @@ class SumoBridge(Node):
         self._publish_rate = self.get_parameter("publish_rate").value
         self._detection_radius = self.get_parameter("detection_radius_m").value
         self._use_gui = self.get_parameter("use_gui").value
-        self._max_vehicles = self.get_parameter("max_vehicles").value
+        self._target_vehicle_count = self.get_parameter("target_vehicle_count").value
 
         self._net_path = self._cache_dir / self._net_filename
         self._cfg_path = self._cache_dir / self._cfg_filename
@@ -101,6 +128,7 @@ class SumoBridge(Node):
             TrafficVehicleArray, "/perception/traffic_vehicles", qos
         )
         self._status_pub = self.create_publisher(String, "/simulation/status", 10)
+        self._count_pub = self.create_publisher(String, "/simulation/traffic_count", 10)
 
         self._command_sub = self.create_subscription(
             VehicleCommand, "/vehicle/command", self._on_command, qos
@@ -117,6 +145,9 @@ class SumoBridge(Node):
         self._sumo_running = False
         self._ego_spawned = False
         self._traci = None
+        self._valid_edges: list = []
+        self._spawn_counter = 0
+        self._tick_count = 0
 
         self._timer = self.create_timer(1.0 / self._publish_rate, self._tick)
 
@@ -156,20 +187,15 @@ class SumoBridge(Node):
 
         sumo_binary = "sumo-gui" if self._use_gui else "sumo"
 
-        # Prefer the .sumocfg (includes polygons + settings). Fall back to --net-file.
         use_cfg = self._cfg_path.exists()
         if use_cfg:
             base_args = [sumo_binary, "-c", str(self._cfg_path)]
         else:
-            self.get_logger().warn(
-                "sumocfg not found — starting SUMO with net-file only (no polygons)."
-            )
+            self.get_logger().warn("sumocfg not found — starting with net-file only.")
             base_args = [sumo_binary, "--net-file", str(self._net_path)]
 
-        # Attach viewsettings if available (dark theme, AV-style colors).
         viewsettings_path = Path(__file__).parent.parent / "config" / "viewsettings.xml"
         if not viewsettings_path.exists():
-            # Try installed share path.
             try:
                 from ament_index_python.packages import get_package_share_directory
                 share = get_package_share_directory("ads_simulation")
@@ -177,7 +203,10 @@ class SumoBridge(Node):
             except Exception:
                 pass
 
-        sumo_cmd = base_args + ["--no-step-log", "--no-warnings", "--start"]
+        sumo_cmd = base_args + [
+            "--no-step-log", "--no-warnings", "--start",
+            "--ignore-route-errors",
+        ]
         if self._use_gui and viewsettings_path.exists():
             sumo_cmd += ["--gui-settings-file", str(viewsettings_path)]
             self.get_logger().info(f"Viewsettings loaded: '{viewsettings_path}'")
@@ -187,10 +216,12 @@ class SumoBridge(Node):
         try:
             traci.start(sumo_cmd)
             self._sumo_running = True
+            self._define_bg_vehicle_types()
+            self._cache_valid_edges()
             self._publish_status("RUNNING")
             self.get_logger().info(
                 f"SUMO started — cfg={'yes' if use_cfg else 'no'}, "
-                f"gui={self._use_gui}"
+                f"gui={self._use_gui}, edges={len(self._valid_edges)}"
             )
         except Exception as exc:
             self.get_logger().error(f"Failed to start SUMO: {exc}")
@@ -204,6 +235,55 @@ class SumoBridge(Node):
                 pass
             self._sumo_running = False
             self.get_logger().info("SUMO stopped.")
+
+    # ------------------------------------------------------------------
+    # Background traffic setup
+    # ------------------------------------------------------------------
+
+    def _define_bg_vehicle_types(self) -> None:
+        existing = self._traci.vehicletype.getIDList()
+        for vtype, _ in _BG_VEHICLE_TYPES:
+            if vtype not in existing:
+                self._traci.vehicletype.copy("DEFAULT_VEHTYPE", vtype)
+
+        if _EGO_TYPE not in existing:
+            self._traci.vehicletype.copy("DEFAULT_VEHTYPE", _EGO_TYPE)
+
+    def _cache_valid_edges(self) -> None:
+        all_edges = self._traci.edge.getIDList()
+        self._valid_edges = [
+            e for e in all_edges
+            if not e.startswith(":")
+            and self._traci.edge.getLaneNumber(e) > 0
+        ]
+        self.get_logger().info(
+            f"Edge cache built — {len(self._valid_edges)} valid edges"
+        )
+
+    def _spawn_bg_vehicle(self) -> None:
+        if len(self._valid_edges) < 2:
+            return
+        src = random.choice(self._valid_edges)
+        dst = random.choice(self._valid_edges)
+        if src == dst:
+            return
+        vid = _rand_id()
+        route_id = f"route_{vid}"
+        vtype = _weighted_choice(_BG_VEHICLE_TYPES)
+        color = random.choice(_BG_COLORS)
+        try:
+            self._traci.route.add(route_id, [src, dst])
+            self._traci.vehicle.add(
+                vid, routeID=route_id, typeID=vtype,
+                departSpeed="speedLimit", departLane="random",
+            )
+            self._traci.vehicle.setColor(vid, color)
+            self._spawn_counter += 1
+        except Exception:
+            try:
+                self._traci.route.remove(route_id)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Subscriptions
@@ -238,7 +318,6 @@ class SumoBridge(Node):
         try:
             traci = self._traci
 
-            # Find nearest SUMO edges to start and end waypoints.
             start_x, start_y = traci.simulation.convertGeo(
                 start_wp.longitude, start_wp.latitude, fromGeo=True
             )
@@ -249,12 +328,10 @@ class SumoBridge(Node):
             start_edge = traci.simulation.convertRoad(start_x, start_y, isGeo=False)[0]
             end_edge = traci.simulation.convertRoad(end_x, end_y, isGeo=False)[0]
 
-            # Build a SUMO route for the ego vehicle.
             route_id = "ego_route"
             try:
                 traci.route.add(route_id, [start_edge, end_edge])
             except Exception:
-                # Route may already exist from a prior run.
                 pass
 
             traci.vehicle.add(
@@ -264,13 +341,11 @@ class SumoBridge(Node):
                 departSpeed=str(self.get_parameter("ego_depart_speed").value),
                 departLane="best",
             )
-
-            # Style the ego vehicle distinctively in the GUI.
             traci.vehicle.setColor(_EGO_ID, (0, 200, 255, 255))  # Cyan
 
             self._ego_spawned = True
             self.get_logger().info(
-                f"Ego vehicle spawned at edge '{start_edge}', "
+                f"Ego vehicle spawned — start edge '{start_edge}', "
                 f"destination edge '{end_edge}'"
             )
         except Exception as exc:
@@ -305,12 +380,38 @@ class SumoBridge(Node):
             self._sumo_running = False
             return
 
-        if not self._ego_spawned:
-            return
+        self._tick_count += 1
 
-        self._apply_command()
-        self._publish_ego_state()
-        self._publish_traffic()
+        if self._ego_spawned:
+            self._apply_command()
+            self._publish_ego_state()
+            self._publish_traffic()
+
+        # Top up background traffic every 20 ticks (~1 second at 20 Hz).
+        if self._tick_count % 20 == 0:
+            self._top_up_traffic()
+
+    def _top_up_traffic(self) -> None:
+        if not self._valid_edges:
+            return
+        try:
+            all_ids = self._traci.vehicle.getIDList()
+            current = len(all_ids)
+            deficit = self._target_vehicle_count - current
+            for _ in range(min(deficit, 3)):  # max 3 spawns per second
+                self._spawn_bg_vehicle()
+
+            msg = String()
+            msg.data = (
+                f"Active: {current} | "
+                f"Target: {self._target_vehicle_count} | "
+                f"Total spawned: {self._spawn_counter}"
+            )
+            self._count_pub.publish(msg)
+        except Exception as exc:
+            self.get_logger().warn(
+                f"Traffic top-up error: {exc}", throttle_duration_sec=5.0
+            )
 
     def _apply_command(self) -> None:
         cmd = self._latest_command
@@ -325,7 +426,6 @@ class SumoBridge(Node):
             if cmd.target_speed >= 0.0:
                 self._traci.vehicle.setSpeed(_EGO_ID, cmd.target_speed)
 
-            # Lane changes — SUMO uses lane index, positive = left, negative = right.
             steer = cmd.steering_angle
             if abs(steer) > 0.1:
                 direction = (
@@ -336,7 +436,9 @@ class SumoBridge(Node):
                 self._traci.vehicle.changeLane(_EGO_ID, direction, duration=3.0)
 
         except Exception as exc:
-            self.get_logger().warn(f"Command application failed: {exc}", throttle_duration_sec=2.0)
+            self.get_logger().warn(
+                f"Command application failed: {exc}", throttle_duration_sec=2.0
+            )
 
     def _publish_ego_state(self) -> None:
         if _EGO_ID not in self._traci.vehicle.getIDList():
@@ -345,8 +447,8 @@ class SumoBridge(Node):
         try:
             x, y = self._traci.vehicle.getPosition(_EGO_ID)
             speed = self._traci.vehicle.getSpeed(_EGO_ID)
-            angle_deg = self._traci.vehicle.getAngle(_EGO_ID)  # SUMO: 0=north, CW
-            heading_rad = math.radians(90.0 - angle_deg)       # convert to standard (0=east, CCW)
+            angle_deg = self._traci.vehicle.getAngle(_EGO_ID)
+            heading_rad = math.radians(90.0 - angle_deg)
 
             msg = VehicleState()
             msg.header.stamp = self.get_clock().now().to_msg()
@@ -380,9 +482,7 @@ class SumoBridge(Node):
             return
 
         traffic_msgs = []
-        all_ids = self._traci.vehicle.getIDList()
-
-        for vid in all_ids:
+        for vid in self._traci.vehicle.getIDList():
             if vid == _EGO_ID:
                 continue
             try:
@@ -391,23 +491,16 @@ class SumoBridge(Node):
                 if dist > self._detection_radius:
                     continue
 
-                vspeed = self._traci.vehicle.getSpeed(vid)
-                vangle_deg = self._traci.vehicle.getAngle(vid)
-                vheading = math.radians(90.0 - vangle_deg)
-                vlane = self._traci.vehicle.getLaneID(vid)
-                vtype = self._traci.vehicle.getTypeID(vid)
-
                 tv = TrafficVehicle()
                 tv.vehicle_id = vid
                 tv.x = vx
                 tv.y = vy
-                tv.speed = vspeed
-                tv.heading = vheading
-                tv.lane_id = vlane
+                tv.speed = self._traci.vehicle.getSpeed(vid)
+                tv.heading = math.radians(90.0 - self._traci.vehicle.getAngle(vid))
+                tv.lane_id = self._traci.vehicle.getLaneID(vid)
                 tv.distance_to_ego = dist
-                tv.vehicle_type = vtype
+                tv.vehicle_type = self._traci.vehicle.getTypeID(vid)
                 traffic_msgs.append(tv)
-
             except Exception:
                 continue
 
@@ -417,7 +510,7 @@ class SumoBridge(Node):
         arr.header.stamp = self.get_clock().now().to_msg()
         arr.header.frame_id = "map"
         arr.vehicles = traffic_msgs
-        arr.total_simulated = len(all_ids) - 1
+        arr.total_simulated = len(self._traci.vehicle.getIDList()) - 1
         arr.detection_radius_m = self._detection_radius
         self._traffic_pub.publish(arr)
 

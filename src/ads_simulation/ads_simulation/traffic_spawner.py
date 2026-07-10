@@ -27,11 +27,11 @@ from std_msgs.msg import String
 
 
 _VEHICLE_TYPES = [
-    ("passenger", 0.65),    # 65% regular cars
-    ("passenger/van", 0.15),  # 15% vans
-    ("truck", 0.10),          # 10% trucks
-    ("bus", 0.05),            # 5% buses
-    ("motorcycle", 0.05),     # 5% motorcycles
+    ("car", 0.65),
+    ("van", 0.15),
+    ("truck", 0.10),
+    ("bus", 0.05),
+    ("moto", 0.05),
 ]
 
 _VEHICLE_COLORS = [
@@ -112,6 +112,7 @@ class TrafficSpawner(Node):
             import traci
             self._traci = traci
             self._simulation_running = True
+            self._define_vehicle_types()
             self._cache_valid_edges()
             self.get_logger().info(
                 f"TrafficSpawner connected to SUMO — "
@@ -122,6 +123,12 @@ class TrafficSpawner(Node):
         except Exception as exc:
             self.get_logger().error(f"TraCI connection failed: {exc}")
 
+    def _define_vehicle_types(self) -> None:
+        existing = self._traci.vehicletype.getIDList()
+        for vtype, _ in _VEHICLE_TYPES:
+            if vtype not in existing:
+                self._traci.vehicletype.copy("DEFAULT_VEHTYPE", vtype)
+
     def _cache_valid_edges(self) -> None:
         """Build a list of edges long enough to use as spawning sources."""
         try:
@@ -130,8 +137,8 @@ class TrafficSpawner(Node):
 
             self._valid_edges = [
                 e for e in all_edges
-                if not e.startswith(":")              # exclude internal junctions
-                and self._traci.edge.getLastStepLength(e) > 0  # has driveable length
+                if not e.startswith(":")              # exclude internal junction edges
+                and self._traci.edge.getLaneNumber(e) > 0
             ]
 
             self.get_logger().info(

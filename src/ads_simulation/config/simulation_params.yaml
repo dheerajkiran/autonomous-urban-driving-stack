@@ -10,14 +10,7 @@ sumo_bridge:
     detection_radius_m: 80.0            # Nearby vehicle detection radius [m]
     use_gui: false                      # sumo-gui not available on ARM64 — using custom Pygame viewer
     ego_depart_speed: 0.0               # Ego spawn speed [m/s]
-    max_vehicles: 100
-
-traffic_spawner:
-  ros__parameters:
     target_vehicle_count: 60            # Background vehicles to maintain on the network
-    spawn_rate: 2.0                     # Max new vehicles per second
-    spawn_check_interval: 1.0           # How often to check and top up [s]
-    min_route_length_m: 500.0           # Minimum valid route length for spawned vehicles
 
 mission_input:
   ros__parameters: {}                   # No parameters — all interaction is via terminal

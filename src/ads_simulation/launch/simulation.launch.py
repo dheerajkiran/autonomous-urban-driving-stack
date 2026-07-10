@@ -62,21 +62,10 @@ def generate_launch_description() -> LaunchDescription:
         emulate_tty=True,
     )
 
-    traffic_spawner = Node(
-        package="ads_simulation",
-        executable="traffic_spawner",
-        name="traffic_spawner",
-        parameters=[config_path],
-        arguments=["--ros-args", "--log-level", log_level],
-        output="screen",
-        emulate_tty=True,
-    )
-
     return LaunchDescription([
         log_level_arg,
         use_gui_arg,
         LogInfo(msg=["[ADS] Launching simulation layer — gui=", use_gui]),
         mission_input,
         sumo_bridge,
-        traffic_spawner,
     ])
