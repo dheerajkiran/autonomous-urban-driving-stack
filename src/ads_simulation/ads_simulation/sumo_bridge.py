@@ -177,7 +177,7 @@ class SumoBridge(Node):
             except Exception:
                 pass
 
-        sumo_cmd = base_args + ["--no-step-log", "--no-warnings"]
+        sumo_cmd = base_args + ["--no-step-log", "--no-warnings", "--start"]
         if self._use_gui and viewsettings_path.exists():
             sumo_cmd += ["--gui-settings-file", str(viewsettings_path)]
             self.get_logger().info(f"Viewsettings loaded: '{viewsettings_path}'")

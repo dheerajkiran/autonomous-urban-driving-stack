@@ -35,7 +35,7 @@ def generate_launch_description() -> LaunchDescription:
     )
     use_gui_arg = DeclareLaunchArgument(
         "use_gui",
-        default_value="true",
+        default_value="false",
         description="Launch sumo-gui (true) or headless sumo (false).",
     )
 
