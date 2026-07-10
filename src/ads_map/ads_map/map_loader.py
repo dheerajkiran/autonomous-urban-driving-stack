@@ -176,8 +176,6 @@ class MapLoader(Node):
                 "--tls.join",
                 "--output.street-names",
                 "--output.original-names",
-                "--osm.sidewalks", "false",
-                "--osm.crossings", "false",
             ],
             capture_output=True,
             text=True,
