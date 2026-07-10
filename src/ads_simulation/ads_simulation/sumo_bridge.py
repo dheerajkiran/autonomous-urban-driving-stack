@@ -307,6 +307,24 @@ class SumoBridge(Node):
     # Ego vehicle management
     # ------------------------------------------------------------------
 
+    def _nearest_real_edge(self, x: float, y: float) -> str:
+        """Return the nearest non-internal edge to (x, y) in SUMO coordinates."""
+        candidate = self._traci.simulation.convertRoad(x, y, isGeo=False)[0]
+        if not candidate.startswith(":"):
+            return candidate
+        # Fall back to closest edge in our valid_edges list.
+        best_edge, best_dist = None, float("inf")
+        for edge in self._valid_edges:
+            try:
+                shape = self._traci.lane.getShape(f"{edge}_0")
+                ex, ey = shape[0]
+                dist = math.sqrt((ex - x) ** 2 + (ey - y) ** 2)
+                if dist < best_dist:
+                    best_dist, best_edge = dist, edge
+            except Exception:
+                continue
+        return best_edge or self._valid_edges[0]
+
     def _spawn_ego(self) -> None:
         if self._active_route is None or not self._active_route.waypoints:
             return
@@ -325,8 +343,8 @@ class SumoBridge(Node):
                 end_wp.longitude, end_wp.latitude, fromGeo=True
             )
 
-            start_edge = traci.simulation.convertRoad(start_x, start_y, isGeo=False)[0]
-            end_edge = traci.simulation.convertRoad(end_x, end_y, isGeo=False)[0]
+            start_edge = self._nearest_real_edge(start_x, start_y)
+            end_edge = self._nearest_real_edge(end_x, end_y)
 
             route_id = "ego_route"
             try:
