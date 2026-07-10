@@ -25,6 +25,7 @@ setup(
             "mission_input = ads_simulation.mission_input:main",
             "sumo_bridge = ads_simulation.sumo_bridge:main",
             "traffic_spawner = ads_simulation.traffic_spawner:main",
+            "mission_monitor = ads_simulation.mission_monitor:main",
         ],
     },
 )

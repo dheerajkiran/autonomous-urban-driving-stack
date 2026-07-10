@@ -401,9 +401,14 @@ class SumoBridge(Node):
         self._tick_count += 1
 
         if self._ego_spawned:
-            self._apply_command()
-            self._publish_ego_state()
-            self._publish_traffic()
+            if _EGO_ID not in self._traci.vehicle.getIDList():
+                self._ego_spawned = False
+                self._publish_status("EGO_ARRIVED")
+                self.get_logger().info("Ego vehicle reached destination and was removed by SUMO.")
+            else:
+                self._apply_command()
+                self._publish_ego_state()
+                self._publish_traffic()
 
         # Top up background traffic every 20 ticks (~1 second at 20 Hz).
         if self._tick_count % 20 == 0:
