@@ -65,9 +65,13 @@ class MapLoader(Node):
         self._cfg_path     = self._cache_dir / "tempe.sumocfg"
 
         self._status_pub = self.create_publisher(String, "/map/status", 10)
+        self._last_status: str = ""
 
         # Defer heavy work to after the node is spinning so logs appear cleanly.
         self.create_timer(0.1, self._bootstrap, clock=self.get_clock())
+        # Republish the last status every 3 s so late-starting nodes (sumo_bridge,
+        # route_planner) always receive READY even if they missed the initial publish.
+        self.create_timer(3.0, self._republish_status, clock=self.get_clock())
         self._bootstrapped = False
 
         self.get_logger().info(
@@ -95,10 +99,17 @@ class MapLoader(Node):
             self._publish_status(self._STATUS_ERROR)
 
     def _publish_status(self, status: str) -> None:
+        self._last_status = status
         msg = String()
         msg.data = status
         self._status_pub.publish(msg)
         self.get_logger().info(f"Map status: {status}")
+
+    def _republish_status(self) -> None:
+        if self._last_status:
+            msg = String()
+            msg.data = self._last_status
+            self._status_pub.publish(msg)
 
     # ------------------------------------------------------------------
     # OSM graph

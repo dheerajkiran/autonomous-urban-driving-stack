@@ -136,6 +136,9 @@ class SumoBridge(Node):
         self._route_sub = self.create_subscription(
             Route, "/navigation/route", self._on_route, 10
         )
+        self._go_sub = self.create_subscription(
+            String, "/navigation/mission_confirm", self._on_mission_confirm, 10
+        )
         self._map_status_sub = self.create_subscription(
             String, "/map/status", self._on_map_status, 10
         )
@@ -206,6 +209,7 @@ class SumoBridge(Node):
         sumo_cmd = base_args + [
             "--no-step-log", "--no-warnings", "--start",
             "--ignore-route-errors",
+            "--tls.all-off",
         ]
         if self._use_gui and viewsettings_path.exists():
             sumo_cmd += ["--gui-settings-file", str(viewsettings_path)]
@@ -248,6 +252,10 @@ class SumoBridge(Node):
 
         if _EGO_TYPE not in existing:
             self._traci.vehicletype.copy("DEFAULT_VEHTYPE", _EGO_TYPE)
+
+        # Faster acceleration so ego recovers from junction stops quickly.
+        self._traci.vehicletype.setAccel(_EGO_TYPE, 5.0)
+        self._traci.vehicletype.setDecel(_EGO_TYPE, 6.0)
 
     def _cache_valid_edges(self) -> None:
         all_edges = self._traci.edge.getIDList()
@@ -295,13 +303,26 @@ class SumoBridge(Node):
     def _on_route(self, msg: Route) -> None:
         self._active_route = msg
         self.get_logger().info(
-            f"Route received: '{msg.start_address}' → '{msg.end_address}', "
-            f"{len(msg.waypoints)} waypoints"
+            f"Route ready: '{msg.start_address}' → '{msg.end_address}', "
+            f"{len(msg.waypoints)} waypoints — press SPACE in viewer to start ego"
         )
-        if self._sumo_running and not self._ego_spawned:
-            self._spawn_ego()
-        elif self._sumo_running and self._ego_spawned:
-            self._update_ego_destination()
+
+    def _on_mission_confirm(self, msg: String) -> None:
+        if not self._sumo_running:
+            self.get_logger().warn("GO received but SUMO is not running yet.")
+            return
+        if self._active_route is None:
+            self.get_logger().warn("GO received but no route is loaded yet.")
+            return
+        if self._ego_spawned:
+            # Remove current ego so we can respawn on the new route.
+            try:
+                self._traci.vehicle.remove(_EGO_ID)
+            except Exception:
+                pass
+            self._ego_spawned = False
+        self.get_logger().info("GO — spawning ego on current route.")
+        self._spawn_ego()
 
     # ------------------------------------------------------------------
     # Ego vehicle management
@@ -325,30 +346,90 @@ class SumoBridge(Node):
                 continue
         return best_edge or self._valid_edges[0]
 
+    def _build_route_edges(self, waypoints) -> list:
+        """Convert A* waypoints to a connected SUMO edge sequence.
+
+        Only keeps waypoints that are at least 150 m apart so that each
+        findRoute sub-call spans a meaningful stretch of road and avoids
+        routing around a block when two waypoints fall on neighbouring
+        junction edges.
+        """
+        MIN_SPACING = 150.0  # metres
+
+        # Project waypoints and thin them out.
+        # Skip osmid==0 entries — those are display-only geometry interpolation points
+        # added by route_planner. Using them for SUMO routing causes nearest_real_edge
+        # to snap to wrong edges on parallel roads.
+        sparse: list = []   # [(x, y, edge)]
+        for wp in waypoints:
+            if wp.osmid == 0:
+                continue
+            x, y = self._traci.simulation.convertGeo(
+                wp.longitude, wp.latitude, fromGeo=True
+            )
+            if sparse:
+                px, py, _ = sparse[-1]
+                if math.sqrt((x - px) ** 2 + (y - py) ** 2) < MIN_SPACING:
+                    continue
+            edge = self._nearest_real_edge(x, y)
+            if edge and (not sparse or edge != sparse[-1][2]):
+                sparse.append((x, y, edge))
+
+        if not sparse:
+            return []
+
+        # Always include the last waypoint as the final destination.
+        last_wp = waypoints[-1]
+        lx, ly = self._traci.simulation.convertGeo(
+            last_wp.longitude, last_wp.latitude, fromGeo=True
+        )
+        last_edge = self._nearest_real_edge(lx, ly)
+        if last_edge and last_edge != sparse[-1][2]:
+            sparse.append((lx, ly, last_edge))
+
+        wp_edges = [e for _, _, e in sparse]
+
+        if len(wp_edges) < 2:
+            return wp_edges
+
+        # Stitch sub-routes between each consecutive pair.
+        full_edges: list = []
+        for i in range(len(wp_edges) - 1):
+            try:
+                result = self._traci.simulation.findRoute(
+                    wp_edges[i], wp_edges[i + 1], "", -1.0, 0
+                )
+                sub = list(result.edges)
+            except Exception:
+                sub = [wp_edges[i], wp_edges[i + 1]]
+
+            if not sub:
+                continue
+            if full_edges and full_edges[-1] == sub[0]:
+                full_edges.extend(sub[1:])
+            else:
+                full_edges.extend(sub)
+
+        return full_edges if full_edges else wp_edges
+
     def _spawn_ego(self) -> None:
         if self._active_route is None or not self._active_route.waypoints:
             return
 
-        route = self._active_route
-        start_wp = route.waypoints[0]
-        end_wp = route.waypoints[-1]
-
         try:
             traci = self._traci
 
-            start_x, start_y = traci.simulation.convertGeo(
-                start_wp.longitude, start_wp.latitude, fromGeo=True
-            )
-            end_x, end_y = traci.simulation.convertGeo(
-                end_wp.longitude, end_wp.latitude, fromGeo=True
-            )
+            if _EGO_TYPE not in traci.vehicletype.getIDList():
+                traci.vehicletype.copy("DEFAULT_VEHTYPE", _EGO_TYPE)
 
-            start_edge = self._nearest_real_edge(start_x, start_y)
-            end_edge = self._nearest_real_edge(end_x, end_y)
+            route_edges = self._build_route_edges(self._active_route.waypoints)
+            if len(route_edges) < 2:
+                self.get_logger().error("Could not build a valid SUMO route from waypoints.")
+                return
 
             route_id = "ego_route"
             try:
-                traci.route.add(route_id, [start_edge, end_edge])
+                traci.route.add(route_id, route_edges)
             except Exception:
                 pass
 
@@ -356,15 +437,19 @@ class SumoBridge(Node):
                 _EGO_ID,
                 routeID=route_id,
                 typeID=_EGO_TYPE,
-                departSpeed=str(self.get_parameter("ego_depart_speed").value),
+                departSpeed="speedLimit",
                 departLane="best",
             )
-            traci.vehicle.setColor(_EGO_ID, (0, 200, 255, 255))  # Cyan
+            traci.vehicle.setColor(_EGO_ID, (0, 200, 255, 255))
+
+            # Clear junction right-of-way bit (8) so ego doesn't pause at minor roads.
+            # Bits 1+2+4 (safe speed, accel, decel) remain set. TLS already off globally.
+            traci.vehicle.setSpeedMode(_EGO_ID, 7)
 
             self._ego_spawned = True
             self.get_logger().info(
-                f"Ego vehicle spawned — start edge '{start_edge}', "
-                f"destination edge '{end_edge}'"
+                f"Ego spawned — {len(route_edges)} SUMO edges following A* plan "
+                f"({len(self._active_route.waypoints)} waypoints)"
             )
         except Exception as exc:
             self.get_logger().error(f"Failed to spawn ego vehicle: {exc}")
@@ -400,55 +485,48 @@ class SumoBridge(Node):
 
         self._tick_count += 1
 
+        # One getIDList call per tick — reused everywhere below.
+        vehicle_ids = self._traci.vehicle.getIDList()
+
         if self._ego_spawned:
-            if _EGO_ID not in self._traci.vehicle.getIDList():
+            if _EGO_ID not in vehicle_ids:
                 self._ego_spawned = False
                 self._publish_status("EGO_ARRIVED")
-                self.get_logger().info("Ego vehicle reached destination and was removed by SUMO.")
+                self.get_logger().info("Ego vehicle reached destination.")
             else:
                 self._apply_command()
                 self._publish_ego_state()
-                self._publish_traffic()
+                if self._target_vehicle_count > 0:
+                    self._publish_traffic(vehicle_ids)
 
-        # Top up background traffic every 20 ticks (~1 second at 20 Hz).
-        if self._tick_count % 20 == 0:
-            self._top_up_traffic()
+        if self._target_vehicle_count > 0 and self._tick_count % 20 == 0:
+            self._top_up_traffic(vehicle_ids)
 
-    def _top_up_traffic(self) -> None:
+    def _top_up_traffic(self, vehicle_ids) -> None:
         if not self._valid_edges:
             return
         try:
-            all_ids = self._traci.vehicle.getIDList()
-            current = len(all_ids)
+            current = len(vehicle_ids)
             deficit = self._target_vehicle_count - current
-            for _ in range(min(deficit, 3)):  # max 3 spawns per second
+            for _ in range(min(deficit, 3)):
                 self._spawn_bg_vehicle()
-
             msg = String()
-            msg.data = (
-                f"Active: {current} | "
-                f"Target: {self._target_vehicle_count} | "
-                f"Total spawned: {self._spawn_counter}"
-            )
+            msg.data = f"Active: {current} | Target: {self._target_vehicle_count}"
             self._count_pub.publish(msg)
         except Exception as exc:
-            self.get_logger().warn(
-                f"Traffic top-up error: {exc}", throttle_duration_sec=5.0
-            )
+            self.get_logger().warn(f"Traffic top-up error: {exc}", throttle_duration_sec=5.0)
 
     def _apply_command(self) -> None:
+        # Caller guarantees ego is alive — no getIDList() needed here.
         cmd = self._latest_command
-        if cmd is None or _EGO_ID not in self._traci.vehicle.getIDList():
+        if cmd is None:
             return
-
         try:
             if cmd.emergency_stop:
                 self._traci.vehicle.setSpeed(_EGO_ID, 0.0)
                 return
-
             if cmd.target_speed >= 0.0:
                 self._traci.vehicle.setSpeed(_EGO_ID, cmd.target_speed)
-
             steer = cmd.steering_angle
             if abs(steer) > 0.1:
                 direction = (
@@ -457,19 +535,13 @@ class SumoBridge(Node):
                     else self._traci.vehicle.LANECHANGE_RIGHT
                 )
                 self._traci.vehicle.changeLane(_EGO_ID, direction, duration=3.0)
-
         except Exception as exc:
-            self.get_logger().warn(
-                f"Command application failed: {exc}", throttle_duration_sec=2.0
-            )
+            self.get_logger().warn(f"Command failed: {exc}", throttle_duration_sec=2.0)
 
     def _publish_ego_state(self) -> None:
-        if _EGO_ID not in self._traci.vehicle.getIDList():
-            return
-
         try:
-            x, y = self._traci.vehicle.getPosition(_EGO_ID)
-            speed = self._traci.vehicle.getSpeed(_EGO_ID)
+            x, y      = self._traci.vehicle.getPosition(_EGO_ID)
+            speed     = self._traci.vehicle.getSpeed(_EGO_ID)
             angle_deg = self._traci.vehicle.getAngle(_EGO_ID)
             heading_rad = math.radians(90.0 - angle_deg)
 
@@ -487,25 +559,18 @@ class SumoBridge(Node):
             msg.steering_angle = 0.0
             msg.gear = "DRIVE" if speed > 0.1 else "PARK"
             msg.is_autonomous = True
-
             self._state_pub.publish(msg)
-
         except Exception as exc:
-            self.get_logger().warn(
-                f"Failed to read ego state: {exc}", throttle_duration_sec=2.0
-            )
+            self.get_logger().warn(f"Failed to read ego state: {exc}", throttle_duration_sec=2.0)
 
-    def _publish_traffic(self) -> None:
-        if _EGO_ID not in self._traci.vehicle.getIDList():
-            return
-
+    def _publish_traffic(self, vehicle_ids) -> None:
         try:
             ego_x, ego_y = self._traci.vehicle.getPosition(_EGO_ID)
         except Exception:
             return
 
         traffic_msgs = []
-        for vid in self._traci.vehicle.getIDList():
+        for vid in vehicle_ids:
             if vid == _EGO_ID:
                 continue
             try:
@@ -513,7 +578,6 @@ class SumoBridge(Node):
                 dist = math.sqrt((vx - ego_x) ** 2 + (vy - ego_y) ** 2)
                 if dist > self._detection_radius:
                     continue
-
                 tv = TrafficVehicle()
                 tv.vehicle_id = vid
                 tv.x = vx
@@ -527,13 +591,11 @@ class SumoBridge(Node):
             except Exception:
                 continue
 
-        traffic_msgs.sort(key=lambda v: v.distance_to_ego)
-
         arr = TrafficVehicleArray()
         arr.header.stamp = self.get_clock().now().to_msg()
         arr.header.frame_id = "map"
-        arr.vehicles = traffic_msgs
-        arr.total_simulated = len(self._traci.vehicle.getIDList()) - 1
+        arr.vehicles = sorted(traffic_msgs, key=lambda v: v.distance_to_ego)
+        arr.total_simulated = len(vehicle_ids) - 1
         arr.detection_radius_m = self._detection_radius
         self._traffic_pub.publish(arr)
 
