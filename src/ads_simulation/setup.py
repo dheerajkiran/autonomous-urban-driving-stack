@@ -22,10 +22,8 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            "mission_input = ads_simulation.mission_input:main",
             "sumo_bridge = ads_simulation.sumo_bridge:main",
-            "traffic_spawner = ads_simulation.traffic_spawner:main",
-            "mission_monitor = ads_simulation.mission_monitor:main",
+            "pygame_viewer = ads_simulation.pygame_viewer:main",
         ],
     },
 )

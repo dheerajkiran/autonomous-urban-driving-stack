@@ -24,7 +24,6 @@ setup(
         "console_scripts": [
             "map_loader = ads_map.map_loader:main",
             "route_planner = ads_map.route_planner:main",
-            "waypoint_publisher = ads_map.waypoint_publisher:main",
         ],
     },
 )
