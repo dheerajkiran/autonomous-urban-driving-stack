@@ -1,19 +1,15 @@
 """
 Simulation Layer Launch File
 
-Launches the full simulation stack:
-  - mission_input   : terminal prompt for start/destination
-  - sumo_bridge     : SUMO ↔ ROS2 integration (ego vehicle + state publishing)
-  - traffic_spawner : background vehicle population manager
+Launches the SUMO bridge (background traffic simulation) and the
+OpenStreetMap pygame viewer for route planning and visualization.
 
-Depends on the map layer (ads_map) being active first so /map/status == "READY"
-before SUMO starts. Launch the map layer separately or use ads_full.launch.py.
+Ego vehicle spawning is not active in this version — see sumo_bridge.py.
 
 Usage
 -----
   ros2 launch ads_simulation simulation.launch.py
-  ros2 launch ads_simulation simulation.launch.py use_gui:=false   # headless
-  ros2 launch ads_simulation simulation.launch.py traffic:=30      # fewer vehicles
+  ros2 launch ads_simulation simulation.launch.py use_gui:=true   # SUMO GUI window
 """
 
 import os
@@ -40,17 +36,7 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     log_level = LaunchConfiguration("log_level")
-    use_gui = LaunchConfiguration("use_gui")
-
-    mission_input = Node(
-        package="ads_simulation",
-        executable="mission_input",
-        name="mission_input",
-        parameters=[config_path],
-        arguments=["--ros-args", "--log-level", log_level],
-        output="screen",
-        emulate_tty=True,
-    )
+    use_gui   = LaunchConfiguration("use_gui")
 
     sumo_bridge = Node(
         package="ads_simulation",
@@ -62,10 +48,20 @@ def generate_launch_description() -> LaunchDescription:
         emulate_tty=True,
     )
 
+    pygame_viewer = Node(
+        package="ads_simulation",
+        executable="pygame_viewer",
+        name="pygame_viewer",
+        parameters=[config_path],
+        arguments=["--ros-args", "--log-level", log_level],
+        output="screen",
+        emulate_tty=True,
+    )
+
     return LaunchDescription([
         log_level_arg,
         use_gui_arg,
         LogInfo(msg=["[ADS] Launching simulation layer — gui=", use_gui]),
-        mission_input,
         sumo_bridge,
+        pygame_viewer,
     ])
