@@ -200,8 +200,8 @@ class PygameViewer(Node):
         self._default_lat = 33.4255
         self._default_lon = -111.9400
 
-        self.create_subscription(VehicleState,       "/vehicle/state",               self._on_state,   10)
-        self.create_subscription(TrafficVehicleArray,"/perception/traffic_vehicles",  self._on_traffic, 10)
+        self.create_subscription(VehicleState,       "/vehicle/state",               self._on_state,   1)
+        self.create_subscription(TrafficVehicleArray,"/perception/traffic_vehicles",  self._on_traffic, 1)
         self.create_subscription(Route,              "/navigation/route",             self._on_route,   10)
 
         self._goal_pub    = self.create_publisher(String, "/navigation/latlon_goal",    10)

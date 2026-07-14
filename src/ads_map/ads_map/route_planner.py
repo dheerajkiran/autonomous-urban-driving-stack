@@ -67,6 +67,9 @@ class RoutePlanner(Node):
         self._goal_sub = self.create_subscription(
             String, "/navigation/mission_goal", self._on_mission_goal, 10
         )
+        self._latlon_goal_sub = self.create_subscription(
+            String, "/navigation/latlon_goal", self._on_latlon_goal, 10
+        )
 
         self.get_logger().info("RoutePlanner initialized — waiting for map.")
 
@@ -118,22 +121,52 @@ class RoutePlanner(Node):
         self.get_logger().info(f"Route request: '{start_addr}' → '{end_addr}'")
         self._compute_and_publish_route(start_addr, end_addr)
 
+    def _on_latlon_goal(self, msg: String) -> None:
+        """Handle a click-to-drive goal from the Pygame viewer (lat/lon, no geocoding)."""
+        if not self._map_ready:
+            self.get_logger().warn("Lat/lon goal received but map is not ready yet.")
+            return
+        try:
+            goal = json.loads(msg.data)
+            start_lat = float(goal["start_lat"])
+            start_lon = float(goal["start_lon"])
+            end_lat   = float(goal["end_lat"])
+            end_lon   = float(goal["end_lon"])
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            self.get_logger().error(f"Invalid latlon_goal format: {exc}")
+            return
+
+        import osmnx as ox
+        try:
+            start_node = ox.distance.nearest_nodes(self._graph, start_lon, start_lat)
+            end_node   = ox.distance.nearest_nodes(self._graph, end_lon,   end_lat)
+        except Exception as exc:
+            self.get_logger().error(f"nearest_nodes failed: {exc}")
+            return
+
+        start_label = f"{start_lat:.5f}, {start_lon:.5f}"
+        end_label   = f"{end_lat:.5f}, {end_lon:.5f}"
+        self.get_logger().info(f"Lat/lon route: ({start_label}) → ({end_label})")
+        self._route_from_nodes(start_node, end_node, start_label, end_label)
+
     def _compute_and_publish_route(self, start_addr: str, end_addr: str) -> None:
         import osmnx as ox
-        import networkx as nx
 
         try:
             start_node = ox.distance.nearest_nodes(
-                self._graph,
-                *self._geocode(start_addr)
+                self._graph, *self._geocode(start_addr)
             )
             end_node = ox.distance.nearest_nodes(
-                self._graph,
-                *self._geocode(end_addr)
+                self._graph, *self._geocode(end_addr)
             )
         except Exception as exc:
             self.get_logger().error(f"Geocoding failed: {exc}")
             return
+
+        self._route_from_nodes(start_node, end_node, start_addr, end_addr)
+
+    def _route_from_nodes(self, start_node, end_node, start_label: str, end_label: str) -> None:
+        import networkx as nx
 
         try:
             node_path = nx.shortest_path(
@@ -141,7 +174,7 @@ class RoutePlanner(Node):
             )
         except nx.NetworkXNoPath:
             self.get_logger().error(
-                f"No path found between '{start_addr}' and '{end_addr}'."
+                f"No path found between '{start_label}' and '{end_label}'."
             )
             return
 
@@ -153,8 +186,8 @@ class RoutePlanner(Node):
         route_msg = Route()
         route_msg.header.stamp = self.get_clock().now().to_msg()
         route_msg.header.frame_id = "map"
-        route_msg.start_address = start_addr
-        route_msg.end_address = end_addr
+        route_msg.start_address = start_label
+        route_msg.end_address   = end_label
         route_msg.total_distance_m = total_distance
         route_msg.estimated_duration_s = estimated_duration
         route_msg.waypoints = waypoints
@@ -182,24 +215,49 @@ class RoutePlanner(Node):
         return lon, lat  # osmnx nearest_nodes expects (X=lon, Y=lat)
 
     def _nodes_to_waypoints(self, node_path: list) -> list[Waypoint]:
+        """Build waypoints from A* node path, including OSM edge geometry so the
+        displayed route follows actual road curves instead of straight-line shortcuts."""
         waypoints = []
-        for osmid in node_path:
-            node_data = self._graph.nodes[osmid]
-            lat = node_data.get("y", 0.0)
-            lon = node_data.get("x", 0.0)
-
+        for i, osmid in enumerate(node_path):
+            node_data   = self._graph.nodes[osmid]
+            lat         = node_data.get("y", 0.0)
+            lon         = node_data.get("x", 0.0)
             street_name = self._get_street_name(osmid)
             speed_limit = self._get_speed_limit(osmid)
 
             wp = Waypoint()
-            wp.latitude = lat
-            wp.longitude = lon
-            wp.x = 0.0   # Populated by sumo_bridge after coordinate projection
-            wp.y = 0.0
-            wp.osmid = int(osmid)
+            wp.latitude    = lat
+            wp.longitude   = lon
+            wp.x           = 0.0
+            wp.y           = 0.0
+            wp.osmid       = int(osmid)
             wp.speed_limit = speed_limit
-            wp.road_name = street_name
+            wp.road_name   = street_name
             waypoints.append(wp)
+
+            # Insert intermediate geometry points for this edge so the
+            # route polyline traces the actual road curve, not a straight line.
+            if i < len(node_path) - 1:
+                next_id   = node_path[i + 1]
+                edge_data = self._graph.get_edge_data(osmid, next_id)
+                if edge_data:
+                    edge  = edge_data.get(0, edge_data[next(iter(edge_data))])
+                    geom  = edge.get("geometry", None)
+                    if geom is not None:
+                        try:
+                            coords = list(geom.coords)   # [(lon, lat), ...]
+                            for lon_g, lat_g in coords[1:-1]:
+                                wg = Waypoint()
+                                wg.latitude    = lat_g
+                                wg.longitude   = lon_g
+                                wg.x           = 0.0
+                                wg.y           = 0.0
+                                wg.osmid       = 0
+                                wg.speed_limit = speed_limit
+                                wg.road_name   = street_name
+                                waypoints.append(wg)
+                        except Exception:
+                            pass   # no geometry — straight line is fine
         return waypoints
 
     def _get_street_name(self, node_id) -> str:
