@@ -4,7 +4,6 @@ Map Layer Launch File
 Launches the full map stack:
   - map_loader      : downloads / loads Tempe OSM and generates SUMO network
   - route_planner   : A* routing on the OSM graph
-  - waypoint_publisher : tracks progress along active route
 """
 
 import os
@@ -46,20 +45,9 @@ def generate_launch_description() -> LaunchDescription:
         emulate_tty=True,
     )
 
-    waypoint_publisher = Node(
-        package="ads_map",
-        executable="waypoint_publisher",
-        name="waypoint_publisher",
-        parameters=[config_path],
-        arguments=["--ros-args", "--log-level", log_level],
-        output="screen",
-        emulate_tty=True,
-    )
-
     return LaunchDescription([
         log_level_arg,
         LogInfo(msg=["[ADS] Launching map layer — log_level=", log_level]),
         map_loader,
         route_planner,
-        waypoint_publisher,
     ])

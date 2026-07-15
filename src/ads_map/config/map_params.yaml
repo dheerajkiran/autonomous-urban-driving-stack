@@ -13,8 +13,3 @@ route_planner:
     graphml_filename: tempe_drive.graphml
     default_speed_kph: 50.0             # Assumed speed where OSM has no maxspeed tag
     waypoint_spacing_m: 30.0            # Target spacing between route waypoints [m]
-
-waypoint_publisher:
-  ros__parameters:
-    waypoint_radius_m: 20.0             # Arrival radius — advance to next wp [m]
-    publish_rate: 10.0                  # Hz

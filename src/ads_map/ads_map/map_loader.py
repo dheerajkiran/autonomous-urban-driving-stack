@@ -137,15 +137,15 @@ class MapLoader(Node):
         ox.settings.log_console = False
         ox.settings.use_cache = True
 
-        # Download unsimplified — required for OSM XML export (netconvert/SUMO).
-        self.get_logger().info("Downloading unsimplified graph for SUMO network generation...")
+        # Download unsimplified — its node coordinates define the Overpass
+        # bounding box below, and it's the basis for the GraphML used by A*.
+        self.get_logger().info("Downloading unsimplified graph for route planning...")
         G_raw = ox.graph_from_place(
             self._city_query, network_type=self._network_type, simplify=False
         )
-        ox.save_graph_xml(G_raw, filepath=str(self._osm_path))
-        self.get_logger().info(
-            f"Raw OSM XML saved — {len(G_raw.nodes):,} nodes, {len(G_raw.edges):,} edges"
-        )
+
+        self.get_logger().info("Fetching raw OSM XML from Overpass for SUMO network generation...")
+        self._download_osm_xml(G_raw)
 
         # Simplify for efficient A* route planning and save as GraphML.
         self.get_logger().info("Simplifying graph for route planning...")
@@ -154,6 +154,45 @@ class MapLoader(Node):
         self.get_logger().info(
             f"Simplified graph saved — {len(G.nodes):,} nodes, {len(G.edges):,} edges"
         )
+
+    def _download_osm_xml(self, G_raw) -> None:
+        """Fetch genuine OSM XML from Overpass for the graph's bounding box.
+
+        netconvert builds junction connectivity from node IDs shared between
+        multiple ways. osmnx's own save_graph_xml() reconstructs a synthetic
+        OSM file from its already-processed graph and does not reliably
+        preserve that shared-node structure, which fragments the resulting
+        SUMO network into thousands of disconnected islands. Fetching real
+        Overpass XML for the same area keeps junction connectivity intact.
+        """
+        import requests
+
+        lats = [data["y"] for _, data in G_raw.nodes(data=True)]
+        lons = [data["x"] for _, data in G_raw.nodes(data=True)]
+        pad = 0.002  # ~200m margin so edge-of-city ways aren't clipped mid-road
+        south, north = min(lats) - pad, max(lats) + pad
+        west, east = min(lons) - pad, max(lons) + pad
+
+        query = (
+            "[out:xml][timeout:180];"
+            f'(way["highway"]({south},{west},{north},{east});); '
+            "(._;>;);"
+            "out body;"
+        )
+
+        response = requests.post(
+            "https://overpass-api.de/api/interpreter",
+            data={"data": query},
+            headers={"User-Agent": "autonomous-driving-stack/0.1 (portfolio project)"},
+            timeout=180,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Overpass API request failed (status {response.status_code}): "
+                f"{response.text[:300]}"
+            )
+        self._osm_path.write_text(response.text)
+        self.get_logger().info(f"Raw OSM XML saved — {len(response.text):,} bytes")
 
     # ------------------------------------------------------------------
     # SUMO network

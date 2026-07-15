@@ -325,8 +325,21 @@ class PygameViewer(Node):
         cam_lon = self._default_lon
 
         R_deg = math.pi * EARTH_R / 180.0   # metres per degree latitude
+        next_net_retry = time.time() + 1.0
 
         while True:
+            if self._net is None and time.time() >= next_net_retry:
+                next_net_retry = time.time() + 1.0
+                retried_net = self._try_load_sumo_net()
+                if retried_net is not None:
+                    with self._lock:
+                        self._net = retried_net
+                        if self._route_latlng:
+                            self._route_xy = [
+                                retried_net.convertLonLat2XY(lon, lat)
+                                for lat, lon in self._route_latlng
+                            ]
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     return
@@ -562,13 +575,20 @@ class PygameViewer(Node):
         msg = font.render("Loading coordinate system...", True, HUD_FG)
         screen.blit(msg, (W // 2 - msg.get_width() // 2, H // 2))
         pygame.display.flip()
+        return self._try_load_sumo_net()
+
+    def _try_load_sumo_net(self):
+        """Attempt to load the SUMO net; returns None on failure without logging
+        at error level, since the net file may simply not exist yet if the
+        viewer started before map_loader finished. Called once at startup and
+        retried from the main loop until it succeeds."""
         try:
             import sumolib
             net = sumolib.net.readNet(str(self._net_path), withInternal=False)
             self.get_logger().info("SUMO network loaded for coordinate conversion.")
             return net
         except Exception as exc:
-            self.get_logger().error(f"Could not load SUMO net: {exc}")
+            self.get_logger().warn(f"SUMO net not ready yet ({exc}); will retry.")
             return None
 
 

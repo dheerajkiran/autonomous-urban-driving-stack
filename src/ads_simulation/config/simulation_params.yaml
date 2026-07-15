@@ -11,7 +11,8 @@ sumo_bridge:
     use_gui: false                      # sumo-gui not available on ARM64 — using custom Pygame viewer
     ego_depart_speed: 0.0               # Ego spawn speed [m/s] (overridden to speedLimit in code)
     target_vehicle_count: 0             # 0 = ego only; re-enable when testing traffic scenarios
-    edge_search_radius_m: 50.0          # Max distance from an S/E pin to a candidate SUMO edge
+    edge_search_radius_m: 150.0         # Max distance from an S/E pin to a candidate SUMO edge
+                                         # (generous — map clicks rarely land exactly on-road)
 
 mission_input:
   ros__parameters: {}                   # No parameters — all interaction is via terminal

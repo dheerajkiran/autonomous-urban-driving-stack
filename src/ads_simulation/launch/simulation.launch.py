@@ -1,10 +1,9 @@
 """
 Simulation Layer Launch File
 
-Launches the SUMO bridge (background traffic simulation) and the
-OpenStreetMap pygame viewer for route planning and visualization.
-
-Ego vehicle spawning is not active in this version — see sumo_bridge.py.
+Launches the SUMO bridge (headless SUMO + ego spawning on click-to-drive
+confirm) and the OpenStreetMap pygame viewer for route planning, S/E pin
+placement, and visualization.
 
 Usage
 -----

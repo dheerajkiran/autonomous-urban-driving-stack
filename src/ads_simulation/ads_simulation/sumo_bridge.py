@@ -19,15 +19,19 @@ Subscribes
 Publishes
 ---------
 /simulation/status  (std_msgs/String)
+/vehicle/state       (ads_interfaces/msg/VehicleState)  — ego kinematic state, while ego exists
 """
 
 import json
+import math
 from pathlib import Path
 from typing import Optional
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
+
+from ads_interfaces.msg import VehicleState
 
 
 class SumoBridge(Node):
@@ -55,6 +59,7 @@ class SumoBridge(Node):
         self._cfg_path = self._cache_dir / self._cfg_filename
 
         self._status_pub = self.create_publisher(String, "/simulation/status", 10)
+        self._state_pub  = self.create_publisher(VehicleState, "/vehicle/state", 10)
 
         self._map_status_sub = self.create_subscription(
             String, "/map/status", self._on_map_status, 10
@@ -177,8 +182,16 @@ class SumoBridge(Node):
             self.get_logger().error(f"Failed to load SUMO network for routing: {exc}")
             return False
 
-    def _nearest_edge(self, lat: float, lon: float):
-        """Return the closest drivable SUMO edge to a lat/lon, or None."""
+    def _nearby_edges(self, lat: float, lon: float, limit: int = 5) -> list:
+        """Return up to `limit` drivable SUMO edges near a lat/lon, nearest first.
+
+        Returning several candidates (not just the single closest) matters
+        because OSM-derived networks include short dead-end fragments —
+        driveways, service stubs, turnarounds — that can be geometrically
+        closest to a pin while having no real outgoing connectivity. Trying
+        several candidates lets _spawn_ego fall back past a disconnected
+        stub to a real through-street.
+        """
         x, y = self._net.convertLonLat2XY(lon, lat)
         candidates = self._net.getNeighboringEdges(
             x, y, r=self._edge_search_radius_m, includeJunctions=False
@@ -187,34 +200,41 @@ class SumoBridge(Node):
             (edge, dist) for edge, dist in candidates
             if edge.allows("passenger") and not edge.getID().startswith(":")
         ]
-        if not candidates:
-            return None
         candidates.sort(key=lambda pair: pair[1])
-        return candidates[0][0]
+        return [edge for edge, _dist in candidates[:limit]]
 
     def _spawn_ego(self, goal: dict) -> None:
         if not self._load_net():
             return
 
-        start_edge = self._nearest_edge(goal["start_lat"], goal["start_lon"])
-        end_edge = self._nearest_edge(goal["end_lat"], goal["end_lon"])
-        if start_edge is None or end_edge is None:
+        start_candidates = self._nearby_edges(goal["start_lat"], goal["start_lon"])
+        end_candidates = self._nearby_edges(goal["end_lat"], goal["end_lon"])
+        if not start_candidates or not end_candidates:
             self.get_logger().error(
                 f"No drivable edge within {self._edge_search_radius_m}m of the S or E pin."
             )
             return
 
-        if start_edge.getID() == end_edge.getID():
-            edges = [start_edge]
-        else:
-            path, _cost = self._net.getShortestPath(start_edge, end_edge, vClass="passenger")
-            if path is None:
-                self.get_logger().error(
-                    f"No connected route from edge '{start_edge.getID()}' "
-                    f"to '{end_edge.getID()}'."
-                )
-                return
-            edges = path
+        edges = None
+        start_edge = end_edge = None
+        for s_edge in start_candidates:
+            for e_edge in end_candidates:
+                if s_edge.getID() == e_edge.getID():
+                    edges, start_edge, end_edge = [s_edge], s_edge, e_edge
+                    break
+                path, _cost = self._net.getShortestPath(s_edge, e_edge, vClass="passenger")
+                if path is not None:
+                    edges, start_edge, end_edge = path, s_edge, e_edge
+                    break
+            if edges is not None:
+                break
+
+        if edges is None:
+            self.get_logger().error(
+                f"No connected route found among {len(start_candidates)} start "
+                f"and {len(end_candidates)} end edge candidates near the pins."
+            )
+            return
 
         edge_ids = [edge.getID() for edge in edges]
 
@@ -250,9 +270,33 @@ class SumoBridge(Node):
             return
         try:
             self._traci.simulationStep()
+            self._publish_ego_state()
         except Exception as exc:
             self.get_logger().error(f"SUMO step failed: {exc}")
             self._sumo_running = False
+
+    def _publish_ego_state(self) -> None:
+        if "ego" not in self._traci.vehicle.getIDList():
+            return
+
+        x, y = self._traci.vehicle.getPosition("ego")
+        sumo_angle_deg = self._traci.vehicle.getAngle("ego")  # clockwise from north
+        # Convert to the message's convention: radians, 0 = east, CCW positive.
+        heading = math.atan2(
+            math.sin(math.radians(90.0 - sumo_angle_deg)),
+            math.cos(math.radians(90.0 - sumo_angle_deg)),
+        )
+
+        msg = VehicleState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map"
+        msg.speed = self._traci.vehicle.getSpeed("ego")
+        msg.acceleration = self._traci.vehicle.getAcceleration("ego")
+        msg.heading = heading
+        msg.x = x
+        msg.y = y
+        msg.is_autonomous = True
+        self._state_pub.publish(msg)
 
     def _publish_status(self, status: str) -> None:
         msg = String()
