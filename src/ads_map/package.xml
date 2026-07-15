@@ -4,9 +4,10 @@
   <name>ads_map</name>
   <version>0.1.0</version>
   <description>
-    Map loading, route planning, and waypoint publishing for the Autonomous Driving Stack.
-    Downloads the Tempe, AZ road network from OpenStreetMap via osmnx, computes
-    optimal routes using A*, and publishes waypoints for downstream controllers.
+    Map loading and route planning for the Autonomous Driving Stack.
+    Downloads the Tempe, AZ road network from OpenStreetMap via osmnx and direct
+    Overpass API queries, converts it to a SUMO network, and computes A* routes
+    between addresses or lat/lon click-to-drive goals.
   </description>
   <maintainer email="denna@asu.edu">Dheeraj Kiran</maintainer>
   <license>MIT</license>

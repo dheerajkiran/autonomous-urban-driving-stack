@@ -4,9 +4,11 @@
   <name>ads_simulation</name>
   <version>0.1.0</version>
   <description>
-    SUMO-based traffic simulation bridge for the Autonomous Driving Stack.
-    Manages the ego vehicle in SUMO, spawns background traffic on the Tempe
-    road network, and exposes surrounding vehicles as ROS2 perception messages.
+    SUMO-based simulation bridge for the Autonomous Driving Stack. Runs SUMO
+    headless on the Tempe road network, resolves click-to-drive lat/lon goals
+    to SUMO edges, spawns and drives the ego vehicle, and publishes its state.
+    Also provides the Pygame OpenStreetMap viewer for route visualization and
+    click-to-drive pin placement.
   </description>
   <maintainer email="denna@asu.edu">Dheeraj Kiran</maintainer>
   <license>MIT</license>

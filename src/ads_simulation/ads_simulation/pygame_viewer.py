@@ -3,7 +3,7 @@ Pygame Viewer Node
 
 Real-time map visualization of the ADS simulation using OpenStreetMap
 tile imagery. Renders the full-color Tempe, AZ street map as background,
-with the ego vehicle (cyan), planned route (yellow), and traffic overlaid.
+with the ego vehicle (cyan) and planned route (yellow) overlaid.
 
 Tiles are downloaded from OSM on first run and cached locally — after
 that the viewer works fully offline.
@@ -34,7 +34,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from ads_interfaces.msg import Route, TrafficVehicleArray, VehicleState
+from ads_interfaces.msg import Route, VehicleState
 
 # ── OSM tile config ───────────────────────────────────────────────────────────
 TILE_PX     = 256
@@ -183,7 +183,6 @@ class PygameViewer(Node):
         self._lock        = threading.Lock()
         self._ego: Optional[VehicleState] = None
         self._last_state_time: float = 0.0   # wall-clock time of last VehicleState
-        self._traffic     = []
         self._route_latlng: list = []
         self._route_xy:     list = []
         self._start_addr  = ""
@@ -200,9 +199,8 @@ class PygameViewer(Node):
         self._default_lat = 33.4255
         self._default_lon = -111.9400
 
-        self.create_subscription(VehicleState,       "/vehicle/state",               self._on_state,   1)
-        self.create_subscription(TrafficVehicleArray,"/perception/traffic_vehicles",  self._on_traffic, 1)
-        self.create_subscription(Route,              "/navigation/route",             self._on_route,   10)
+        self.create_subscription(VehicleState, "/vehicle/state",   self._on_state, 1)
+        self.create_subscription(Route,        "/navigation/route", self._on_route, 10)
 
         self._goal_pub    = self.create_publisher(String, "/navigation/latlon_goal",    10)
         self._confirm_pub = self.create_publisher(String, "/navigation/mission_confirm", 10)
@@ -225,10 +223,6 @@ class PygameViewer(Node):
             self._prev_xy = (msg.x, msg.y)
             self._ego = msg
             self._last_state_time = time.time()
-
-    def _on_traffic(self, msg: TrafficVehicleArray) -> None:
-        with self._lock:
-            self._traffic = list(msg.vehicles)
 
     def _on_route(self, msg: Route) -> None:
         with self._lock:
@@ -392,7 +386,6 @@ class PygameViewer(Node):
             with self._lock:
                 ego        = self._ego
                 last_t     = self._last_state_time
-                traffic    = list(self._traffic)
                 route_ll   = list(self._route_latlng)
                 start_a    = self._start_addr
                 end_a      = self._end_addr
@@ -469,7 +462,7 @@ class PygameViewer(Node):
 
             # ── HUD ───────────────────────────────────────────────────────
             self._draw_hud(screen, font_lg, font_sm, ego, dist_km, start_a, end_a,
-                           zoom, len(traffic), cam_free)
+                           zoom, cam_free)
 
             pygame.display.flip()
             clock.tick(FPS)
@@ -519,7 +512,7 @@ class PygameViewer(Node):
     # ── HUD ───────────────────────────────────────────────────────────────────
 
     def _draw_hud(self, screen, font_lg, font_sm, ego, dist_km,
-                  start_a, end_a, zoom, n_traffic, cam_free: bool = False) -> None:
+                  start_a, end_a, zoom, cam_free: bool = False) -> None:
         lines = []
         if ego is not None:
             lines.append((font_lg, f"{ego.speed * 3.6:5.1f} km/h", HUD_FG))
