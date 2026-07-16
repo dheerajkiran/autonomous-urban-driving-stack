@@ -20,6 +20,11 @@ Publishes
 ---------
 /simulation/status  (std_msgs/String)
 /vehicle/state       (ads_interfaces/msg/VehicleState)  — ego kinematic state, while ego exists
+/navigation/route    (ads_interfaces/msg/Route)  — the ego's actual SUMO edge path, published
+                                                    once it spawns. Overwrites the OSM A*
+                                                    preview from route_planner in the viewer,
+                                                    since the two routers can legitimately
+                                                    disagree on which streets to take.
 """
 
 import json
@@ -31,7 +36,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from ads_interfaces.msg import VehicleState
+from ads_interfaces.msg import Route, VehicleState, Waypoint
 
 
 class SumoBridge(Node):
@@ -60,6 +65,7 @@ class SumoBridge(Node):
 
         self._status_pub = self.create_publisher(String, "/simulation/status", 10)
         self._state_pub  = self.create_publisher(VehicleState, "/vehicle/state", 10)
+        self._route_pub  = self.create_publisher(Route, "/navigation/route", 10)
 
         self._map_status_sub = self.create_subscription(
             String, "/map/status", self._on_map_status, 10
@@ -99,6 +105,31 @@ class SumoBridge(Node):
             }
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
             self.get_logger().error(f"Invalid latlon_goal format: {exc}")
+            return
+
+        self._preview_route(self._pending_goal)
+
+    def _preview_route(self, goal: dict) -> None:
+        """Publish the real SUMO route as soon as both pins are placed, before
+        the ego spawns — so the viewer never shows a route the car won't
+        actually drive.
+
+        Pins can be placed before SUMO finishes starting (the Pygame window
+        opens well before "SUMO started" logs) — in that case this bails out
+        silently, but _start_sumo re-calls it once SUMO comes up if a goal is
+        already pending, so no click before that point is lost.
+        """
+        if not self._sumo_running:
+            self.get_logger().info("Preview deferred — SUMO not running yet.")
+            return
+        if not self._load_net():
+            return
+        resolved = self._resolve_route(goal)
+        if resolved is None:
+            return
+        edges, _start_edge, _end_edge = resolved
+        self._publish_actual_route(edges, goal)
+        self.get_logger().info(f"Preview route published — {len(edges)} edges.")
 
     def _on_mission_confirm(self, msg: String) -> None:
         if msg.data != "GO":
@@ -151,6 +182,13 @@ class SumoBridge(Node):
             self.get_logger().info(
                 f"SUMO started — cfg={'yes' if use_cfg else 'no'}, gui={self._use_gui}"
             )
+            # Load the network now, synchronously, so the first pin-placement
+            # doesn't stall behind a multi-second XML parse — sumolib.net.readNet()
+            # on a network this size blocks the whole single-threaded executor,
+            # including the mission_confirm subscription, if deferred to first use.
+            self._load_net()
+            if self._pending_goal is not None:
+                self._preview_route(self._pending_goal)
         except Exception as exc:
             self.get_logger().error(f"Failed to start SUMO: {exc}")
             self._publish_status("ERROR")
@@ -203,39 +241,44 @@ class SumoBridge(Node):
         candidates.sort(key=lambda pair: pair[1])
         return [edge for edge, _dist in candidates[:limit]]
 
-    def _spawn_ego(self, goal: dict) -> None:
-        if not self._load_net():
-            return
+    def _resolve_route(self, goal: dict):
+        """Resolve a lat/lon goal to a connected SUMO edge path.
 
+        Returns (edges, start_edge, end_edge), or None if no drivable edge
+        was found near a pin or no connected path exists between candidates.
+        Shared by _preview_route (before spawn) and _spawn_ego (at spawn) so
+        both always agree on exactly the same route.
+        """
         start_candidates = self._nearby_edges(goal["start_lat"], goal["start_lon"])
         end_candidates = self._nearby_edges(goal["end_lat"], goal["end_lon"])
         if not start_candidates or not end_candidates:
             self.get_logger().error(
                 f"No drivable edge within {self._edge_search_radius_m}m of the S or E pin."
             )
-            return
+            return None
 
-        edges = None
-        start_edge = end_edge = None
         for s_edge in start_candidates:
             for e_edge in end_candidates:
                 if s_edge.getID() == e_edge.getID():
-                    edges, start_edge, end_edge = [s_edge], s_edge, e_edge
-                    break
+                    return [s_edge], s_edge, e_edge
                 path, _cost = self._net.getShortestPath(s_edge, e_edge, vClass="passenger")
                 if path is not None:
-                    edges, start_edge, end_edge = path, s_edge, e_edge
-                    break
-            if edges is not None:
-                break
+                    return path, s_edge, e_edge
 
-        if edges is None:
-            self.get_logger().error(
-                f"No connected route found among {len(start_candidates)} start "
-                f"and {len(end_candidates)} end edge candidates near the pins."
-            )
+        self.get_logger().error(
+            f"No connected route found among {len(start_candidates)} start "
+            f"and {len(end_candidates)} end edge candidates near the pins."
+        )
+        return None
+
+    def _spawn_ego(self, goal: dict) -> None:
+        if not self._load_net():
             return
 
+        resolved = self._resolve_route(goal)
+        if resolved is None:
+            return
+        edges, start_edge, end_edge = resolved
         edge_ids = [edge.getID() for edge in edges]
 
         try:
@@ -255,6 +298,52 @@ class SumoBridge(Node):
             f"Ego spawned — {len(edge_ids)} edges, "
             f"'{start_edge.getID()}' → '{end_edge.getID()}'."
         )
+
+        self._publish_actual_route(edges, goal)
+
+    def _publish_actual_route(self, edges: list, goal: dict) -> None:
+        """Publish the ego's real SUMO edge path as the displayed route.
+
+        route_planner's OSM A* preview and this edge path come from two
+        different graphs (OSM nodes vs. SUMO edges) with different weighting,
+        so they can legitimately pick different streets for the same start/end.
+        Overwriting /navigation/route with the path SUMO will actually drive
+        keeps what the viewer draws honest about what happens.
+        """
+        waypoints = []
+        for i, edge in enumerate(edges):
+            road_name = edge.getName() or edge.getID()
+            speed_limit = edge.getSpeed()
+            shape = edge.getShape(includeJunctions=False)
+            points = shape[1:] if i > 0 else shape   # skip duplicate junction point
+            for x, y in points:
+                lon, lat = self._net.convertXY2LonLat(x, y)
+                wp = Waypoint()
+                wp.latitude    = lat
+                wp.longitude   = lon
+                wp.x           = 0.0
+                wp.y           = 0.0
+                wp.osmid       = 0
+                wp.speed_limit = speed_limit
+                wp.road_name   = road_name
+                waypoints.append(wp)
+
+        total_distance = sum(edge.getLength() for edge in edges)
+        estimated_duration = sum(
+            edge.getLength() / max(edge.getSpeed(), 0.1) for edge in edges
+        )
+
+        route_msg = Route()
+        route_msg.header.stamp = self.get_clock().now().to_msg()
+        route_msg.header.frame_id = "map"
+        route_msg.start_address = f"{goal['start_lat']:.5f}, {goal['start_lon']:.5f}"
+        route_msg.end_address   = f"{goal['end_lat']:.5f}, {goal['end_lon']:.5f}"
+        route_msg.total_distance_m = total_distance
+        route_msg.estimated_duration_s = estimated_duration
+        route_msg.waypoints = waypoints
+        route_msg.current_waypoint_index = 0
+
+        self._route_pub.publish(route_msg)
 
     def _stop_sumo(self) -> None:
         if self._sumo_running and self._traci is not None:

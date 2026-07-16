@@ -67,9 +67,6 @@ class RoutePlanner(Node):
         self._goal_sub = self.create_subscription(
             String, "/navigation/mission_goal", self._on_mission_goal, 10
         )
-        self._latlon_goal_sub = self.create_subscription(
-            String, "/navigation/latlon_goal", self._on_latlon_goal, 10
-        )
 
         self.get_logger().info("RoutePlanner initialized — waiting for map.")
 
@@ -120,34 +117,6 @@ class RoutePlanner(Node):
 
         self.get_logger().info(f"Route request: '{start_addr}' → '{end_addr}'")
         self._compute_and_publish_route(start_addr, end_addr)
-
-    def _on_latlon_goal(self, msg: String) -> None:
-        """Handle a click-to-drive goal from the Pygame viewer (lat/lon, no geocoding)."""
-        if not self._map_ready:
-            self.get_logger().warn("Lat/lon goal received but map is not ready yet.")
-            return
-        try:
-            goal = json.loads(msg.data)
-            start_lat = float(goal["start_lat"])
-            start_lon = float(goal["start_lon"])
-            end_lat   = float(goal["end_lat"])
-            end_lon   = float(goal["end_lon"])
-        except (json.JSONDecodeError, KeyError, ValueError) as exc:
-            self.get_logger().error(f"Invalid latlon_goal format: {exc}")
-            return
-
-        import osmnx as ox
-        try:
-            start_node = ox.distance.nearest_nodes(self._graph, start_lon, start_lat)
-            end_node   = ox.distance.nearest_nodes(self._graph, end_lon,   end_lat)
-        except Exception as exc:
-            self.get_logger().error(f"nearest_nodes failed: {exc}")
-            return
-
-        start_label = f"{start_lat:.5f}, {start_lon:.5f}"
-        end_label   = f"{end_lat:.5f}, {end_lon:.5f}"
-        self.get_logger().info(f"Lat/lon route: ({start_label}) → ({end_label})")
-        self._route_from_nodes(start_node, end_node, start_label, end_label)
 
     def _compute_and_publish_route(self, start_addr: str, end_addr: str) -> None:
         import osmnx as ox
