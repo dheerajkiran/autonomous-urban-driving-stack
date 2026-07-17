@@ -59,9 +59,11 @@ scene.background = new THREE.Color(0x111318);
 scene.fog = new THREE.Fog(0x111318, 200, 1500);
 
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.5, 4000);
-// Wide-ish default so a newly received route is visible immediately,
-// before the ego has spawned and the chase camera has a target.
-camera.position.set(0, 300, 300);
+// Straight-down default (a tiny X epsilon avoids the gimbal singularity
+// of sitting exactly on the up-axis) so a newly received route is visible
+// immediately, before the ego has spawned and the chase camera has a
+// target — matches the straight-down chase angle below.
+camera.position.set(0.01, 300, 0);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 // Supersample thin single-pixel route lines a bit — THREE.Line ignores
@@ -102,17 +104,127 @@ scene.add(grid);
 // view maps to "further away" on screen instead of flipping the scene.
 function toScene(x, y, z = 0) { return new THREE.Vector3(x, z, -y); }
 
-// The route is sent as one ordered, already-connected point sequence, so
-// a single Line strip has no seams/gaps to worry about — unlike drawing
-// each road edge separately, which needed junction-gap patching.
-const routeMat = new THREE.LineBasicMaterial({ color: 0xdfe8ff });
-let routeLine = null;
-function drawRoute(points) {
-  if (routeLine) scene.remove(routeLine);
-  const pts = points.map(([x, y]) => toScene(x, y, 1.0));
-  const geom = new THREE.BufferGeometry().setFromPoints(pts);
-  routeLine = new THREE.Line(geom, routeMat);
-  scene.add(routeLine);
+// ── Lane-accurate road surface ──────────────────────────────────────────
+// The ego's real TraCI position already sits at its true lateral position
+// within its lane — this is purely about drawing real lane width/count so
+// that correctly-positioned car doesn't look like it's drifting off a
+// thin centerline on any road with more than one lane.
+
+// Perpendicular offset of a polyline in the ground (XZ) plane, using each
+// point's local direction of travel (averaged from its neighbors) as the
+// tangent — used both to build each lane's road-surface ribbon and to
+// mark its left/right edges.
+function offsetPolyline(points, offset) {
+  return points.map((p, i) => {
+    const prev = points[Math.max(i - 1, 0)];
+    const next = points[Math.min(i + 1, points.length - 1)];
+    const dir = new THREE.Vector2(next.x - prev.x, next.z - prev.z).normalize();
+    const normal = new THREE.Vector2(-dir.y, dir.x);
+    return new THREE.Vector3(p.x + normal.x * offset, p.y, p.z + normal.y * offset);
+  });
+}
+
+function buildLaneSurface(centerPts, width) {
+  const left = offsetPolyline(centerPts, width / 2);
+  const right = offsetPolyline(centerPts, -width / 2);
+  const positions = [];
+  for (let i = 0; i < centerPts.length - 1; i++) {
+    const a = left[i], b = right[i], c = left[i + 1], d = right[i + 1];
+    positions.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+    positions.push(b.x, b.y, b.z, d.x, d.y, d.z, c.x, c.y, c.z);
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geom.computeVertexNormals();
+  return { geom, left, right };
+}
+
+const laneSurfaceMat = new THREE.MeshStandardMaterial({ color: 0x33383f, side: THREE.DoubleSide });
+// Dashed for dividers between lanes going the same way (you can cross
+// them); solid for the road's outer edges; yellow for the center line
+// between opposing directions — same convention as a real street.
+const dividerMat  = new THREE.LineDashedMaterial({ color: 0xdfe8ff, dashSize: 2, gapSize: 1.5 });
+const outerMat    = new THREE.LineBasicMaterial({ color: 0xdfe8ff });
+const centerMat   = new THREE.LineBasicMaterial({ color: 0xe0c34a });
+
+function markingLine(points, material) {
+  const raised = points.map((p) => new THREE.Vector3(p.x, p.y + 0.02, p.z));
+  const geom = new THREE.BufferGeometry().setFromPoints(raised);
+  const line = new THREE.Line(geom, material);
+  line.computeLineDistances();   // required for dashed materials to render dashed
+  return line;
+}
+
+// Rough "are these two boundaries actually the same physical seam" check —
+// compares the midpoint of each polyline rather than requiring identical
+// sampling between the forward/reverse edges.
+function boundaryDistance(a, b) {
+  const pa = a[Math.floor(a.length / 2)];
+  const pb = b[Math.floor(b.length / 2)];
+  return pa.distanceTo(pb);
+}
+
+let laneGroup = null;
+function drawLanes(edgeGroups) {
+  if (laneGroup) scene.remove(laneGroup);
+  laneGroup = new THREE.Group();
+
+  // One "innermost boundary" candidate per edge group — the side closest
+  // to oncoming traffic, and so the candidate for a shared yellow center
+  // line once paired against the opposing direction's own innermost side.
+  const innerCandidates = [];   // { points, direction }
+
+  for (const group of edgeGroups) {
+    const laneBoundaries = [];
+    for (const lane of group.lanes) {
+      const centerPts = lane.shape.map(([x, y]) => toScene(x, y, 0.5));
+      if (centerPts.length < 2) continue;
+      const { geom, left, right } = buildLaneSurface(centerPts, lane.width);
+      laneGroup.add(new THREE.Mesh(geom, laneSurfaceMat));
+      laneBoundaries.push({ left, right });
+    }
+    if (laneBoundaries.length === 0) continue;
+
+    // SUMO lane index 0 is the rightmost (outer/curb) lane, increasing
+    // toward the innermost lane next to oncoming traffic — getLanes()
+    // preserves that order, so index 0's "right" is the true outer edge
+    // and the last lane's "left" is the innermost boundary.
+    for (let i = 0; i < laneBoundaries.length - 1; i++) {
+      laneGroup.add(markingLine(laneBoundaries[i].left, dividerMat));
+    }
+    laneGroup.add(markingLine(laneBoundaries[0].right, outerMat));
+    innerCandidates.push({
+      points: laneBoundaries[laneBoundaries.length - 1].left,
+      direction: group.direction,
+    });
+  }
+
+  // Pair up forward/reverse innermost boundaries that are actually close
+  // together (the real center of a two-way street) and draw those yellow;
+  // anything left over (a genuinely one-way street's innermost lane) just
+  // keeps the default white outer-edge treatment.
+  const forward = innerCandidates.filter((c) => c.direction === "forward");
+  const reverse = innerCandidates.filter((c) => c.direction === "reverse");
+  const paired = new Set();
+  for (const f of forward) {
+    let best = null, bestDist = Infinity;
+    for (const r of reverse) {
+      if (paired.has(r)) continue;
+      const d = boundaryDistance(f.points, r.points);
+      if (d < bestDist) { bestDist = d; best = r; }
+    }
+    if (best && bestDist < 6) {   // within about one lane width -> genuinely adjacent
+      laneGroup.add(markingLine(f.points, centerMat));
+      laneGroup.add(markingLine(best.points, centerMat));
+      paired.add(f);
+      paired.add(best);
+    }
+  }
+  for (const c of innerCandidates) {
+    if (!paired.has(c)) laneGroup.add(markingLine(c.points, outerMat));
+  }
+
+  scene.add(laneGroup);
 }
 
 // Simple car proxy: body + cabin, nose along +X (rotated to match heading).
@@ -132,22 +244,18 @@ car.visible = false;
 scene.add(car);
 
 let egoSeen = false;
-let egoHeading = 0;   // SUMO convention: 0 = east, CCW positive
-const CHASE_DIST = 30;    // behind the car, along its own heading
-const CHASE_HEIGHT = 18;  // above the car
+// Fixed world-space offset — camera translates to follow the car's
+// position but does not rotate with its heading. A turning car should
+// visibly change screen-direction; the camera holding a constant angle
+// is what makes that turn readable, rather than the camera swinging to
+// keep the car always "facing away," which looks disorienting mid-turn.
+// Purely vertical: straight top-down, not an isometric/angled chase view.
+const CHASE_OFFSET = new THREE.Vector3(0.01, 45, 0);
 
 function animate() {
   requestAnimationFrame(animate);
   if (egoSeen) {
-    // Recomputed from the car's current heading every frame (not a fixed
-    // world-space offset), so the camera always sits directly behind the
-    // car and turns with it — the car reads as constantly driving away
-    // from the camera no matter which real-world direction it's facing.
-    const target = new THREE.Vector3(
-      car.position.x - CHASE_DIST * Math.cos(egoHeading),
-      CHASE_HEIGHT,
-      car.position.z + CHASE_DIST * Math.sin(egoHeading)
-    );
+    const target = car.position.clone().add(CHASE_OFFSET);
     camera.position.lerp(target, 0.08);
     controls.target.lerp(car.position, 0.2);
   }
@@ -178,19 +286,25 @@ function connect() {
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
     if (msg.type === "route") {
-      drawRoute(msg.points);
+      // Not drawn — the wide lane surfaces from the "lanes" message are
+      // the road itself; a separate thin route line on top is redundant.
       // A new route recenters the origin server-side, so the previous
       // ego position is stale until the next real update arrives.
       egoSeen = false;
       car.visible = false;
+    } else if (msg.type === "lanes") {
+      drawLanes(msg.edges);
     } else if (msg.type === "ego") {
       car.visible = true;
       egoSeen = true;
-      car.position.copy(toScene(msg.x, msg.y));
-      egoHeading = msg.heading;
-      // SUMO heading: 0 = east, CCW positive. Scene z is negated, so
-      // rotate the opposite way to keep the nose pointing the right way.
-      car.rotation.y = -msg.heading;
+      car.position.copy(toScene(msg.x, msg.y, 0.5));   // sit on top of the lane surface
+      // SUMO heading: 0 = east, CCW positive, nose along local +X. Working
+      // through Three.js's Y-rotation matrix against toScene's z-negation
+      // shows the *unnegated* heading is what lines the nose up with the
+      // car's actual direction of travel — negating it (as this used to)
+      // mirrors the nose direction for any heading off due east/west,
+      // which reads as the car spinning the wrong way through a turn.
+      car.rotation.y = msg.heading;
       document.getElementById("speed").textContent = (msg.speed * 3.6).toFixed(1) + " km/h";
       document.getElementById("pos").textContent = `x: ${msg.x.toFixed(1)}, y: ${msg.y.toFixed(1)}`;
     }

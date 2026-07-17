@@ -25,6 +25,13 @@ Publishes
                                                     preview from route_planner in the viewer,
                                                     since the two routers can legitimately
                                                     disagree on which streets to take.
+/navigation/route_lanes (std_msgs/String)  — JSON per-lane geometry grouped by edge, for
+                                              car3d_bridge's lane-accurate 3D road rendering:
+                                              {"edges": [{"direction": "forward"|"reverse",
+                                              "lanes": [{"width":, "shape": [[x,y],...]}, ...]}]}.
+                                              Includes each route edge's paired opposite-direction
+                                              edge if one exists. Raw SUMO x/y, not lat/lon — the
+                                              2D viewer doesn't consume this.
 """
 
 import json
@@ -66,6 +73,7 @@ class SumoBridge(Node):
         self._status_pub = self.create_publisher(String, "/simulation/status", 10)
         self._state_pub  = self.create_publisher(VehicleState, "/vehicle/state", 10)
         self._route_pub  = self.create_publisher(Route, "/navigation/route", 10)
+        self._lanes_pub  = self.create_publisher(String, "/navigation/route_lanes", 10)
 
         self._map_status_sub = self.create_subscription(
             String, "/map/status", self._on_map_status, 10
@@ -344,6 +352,62 @@ class SumoBridge(Node):
         route_msg.current_waypoint_index = 0
 
         self._route_pub.publish(route_msg)
+        self._publish_route_lanes(edges)
+
+    def _publish_route_lanes(self, edges: list) -> None:
+        """Publish per-lane geometry for the current route, for car3d_bridge.
+
+        The ego's real TraCI position is already laterally correct for
+        whichever lane it's actually in — this is purely about giving the 3D
+        viewer real lane width/count to render, instead of a single
+        edge-centerline that makes a correctly-positioned car look like it's
+        drifting off a thin line on any multi-lane road.
+
+        Lanes are grouped by edge (not sent as one flat list) so the viewer
+        can tell an internal divider between two lanes of the same edge
+        apart from the road's outer edge. Each route edge's paired
+        opposite-direction edge is looked up and included too (marked
+        direction="reverse") so the full two-way street renders, not just
+        the single direction the ego is actually driving on — netconvert's
+        OSM two-way-street convention pairs edge "123" with "-123", which
+        this relies on; a genuinely one-way street simply has no pair.
+        """
+        def edge_group(edge, direction: str) -> dict:
+            return {
+                "direction": direction,
+                "lanes": [
+                    # includeJunctions=True so adjacent edges' lane ribbons
+                    # actually meet at intersections — a filled surface with
+                    # a gap reads as visibly broken pavement, unlike the thin
+                    # route line where the same option caused zigzag corners
+                    # from tracing complex junction polygons, so it was left
+                    # off there. A zigzag corner is fine on a wide surface.
+                    {
+                        "width": lane.getWidth(),
+                        "shape": [list(p) for p in lane.getShape(includeJunctions=True)],
+                    }
+                    for lane in edge.getLanes()
+                ],
+            }
+
+        groups = [edge_group(edge, "forward") for edge in edges]
+
+        seen_reverse_ids = set()
+        for edge in edges:
+            eid = edge.getID()
+            reverse_id = eid[1:] if eid.startswith("-") else f"-{eid}"
+            if reverse_id in seen_reverse_ids:
+                continue
+            try:
+                reverse_edge = self._net.getEdge(reverse_id)
+            except KeyError:
+                continue
+            seen_reverse_ids.add(reverse_id)
+            groups.append(edge_group(reverse_edge, "reverse"))
+
+        msg = String()
+        msg.data = json.dumps({"edges": groups})
+        self._lanes_pub.publish(msg)
 
     def _stop_sumo(self) -> None:
         if self._sumo_running and self._traci is not None:
