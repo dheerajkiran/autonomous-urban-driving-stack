@@ -321,8 +321,8 @@ class SumoBridge(Node):
                 wp = Waypoint()
                 wp.latitude    = lat
                 wp.longitude   = lon
-                wp.x           = 0.0
-                wp.y           = 0.0
+                wp.x           = x
+                wp.y           = y
                 wp.osmid       = 0
                 wp.speed_limit = speed_limit
                 wp.road_name   = road_name

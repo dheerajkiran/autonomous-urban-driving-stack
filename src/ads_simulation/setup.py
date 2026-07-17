@@ -24,6 +24,7 @@ setup(
         "console_scripts": [
             "sumo_bridge = ads_simulation.sumo_bridge:main",
             "pygame_viewer = ads_simulation.pygame_viewer:main",
+            "car3d_bridge = ads_simulation.car3d_bridge:main",
         ],
     },
 )

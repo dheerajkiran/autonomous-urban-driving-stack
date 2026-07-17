@@ -1,7 +1,7 @@
 # VehicleState.msg
-# Kinematic and actuator state of the autonomous vehicle.
-# Published at 20 Hz by ads_vehicle_state/vehicle_state_publisher.
-# Consumed by: behavior_planner, trajectory_planner, controller, evaluation.
+# Kinematic and actuator state of the ego vehicle.
+# Published by ads_simulation/sumo_bridge from live TraCI data.
+# Consumed by: pygame_viewer, car3d_bridge.
 
 std_msgs/Header header
 

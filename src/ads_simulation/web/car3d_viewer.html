@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ADS — 3D Ego Viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111318; overflow: hidden; font-family: monospace; }
+  canvas { display: block; }
+
+  #hud {
+    position: absolute; top: 10px; left: 10px;
+    color: #d8e6ff; background: rgba(0,0,0,0.55);
+    padding: 10px 14px; border-radius: 6px; font-size: 13px;
+    line-height: 1.6; pointer-events: none;
+  }
+  #hud .big { font-size: 20px; font-weight: bold; }
+  #hud .dim { color: #9aa8bf; }
+
+  #connectBar {
+    position: absolute; top: 10px; right: 10px;
+    background: rgba(0,0,0,0.55); padding: 10px 14px; border-radius: 6px;
+    color: #d8e6ff; font-size: 13px;
+  }
+  #connectBar input {
+    background: #1b1f2a; border: 1px solid #3a4256; color: #d8e6ff;
+    padding: 4px 8px; border-radius: 4px; width: 190px; font-family: monospace;
+  }
+  #connectBar button {
+    background: #2d5fff; border: none; color: white; padding: 5px 12px;
+    border-radius: 4px; margin-left: 6px; cursor: pointer; font-family: monospace;
+  }
+  #connectBar button:hover { background: #4471ff; }
+  #status.ok  { color: #6cf28a; }
+  #status.bad { color: #ff8a6c; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div class="big" id="speed">-- km/h</div>
+  <div class="dim" id="pos">x: --, y: --</div>
+</div>
+
+<div id="connectBar">
+  ws://<input id="wsHost" value="192.168.64.5:8765">
+  <button id="connectBtn">Connect</button>
+  <div id="status" class="bad">disconnected</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+// ── Three.js scene ───────────────────────────────────────────────────────
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111318);
+// Scoped to a single route (a few dozen edges, at most a couple km) rather
+// than the whole city, so fog/camera/ground can stay at a modest,
+// single-vehicle scale instead of needing to cover ~9km x ~15km.
+scene.fog = new THREE.Fog(0x111318, 200, 1500);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.5, 4000);
+// Wide-ish default so a newly received route is visible immediately,
+// before the ego has spawned and the chase camera has a target.
+camera.position.set(0, 300, 300);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+// Supersample thin single-pixel route lines a bit — THREE.Line ignores
+// linewidth on most platforms, and 1px lines shimmer/alias as the camera
+// moves, especially over software-rendered GL in a VM.
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.maxPolarAngle = Math.PI * 0.49;
+// Locked chase cam — always tracks the car at a fixed relative angle once
+// it's seen, so the view doesn't need to be manually aimed. Zoom (scroll)
+// still works for adjusting distance; drag-to-rotate is disabled so the
+// view can't be knocked off the car.
+controls.enableRotate = false;
+controls.enablePan = false;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+sun.position.set(200, 400, 100);
+scene.add(sun);
+
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(4000, 4000),
+  new THREE.MeshStandardMaterial({ color: 0x1a1e28 })
+);
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+const grid = new THREE.GridHelper(4000, 80, 0x2a3142, 0x22293a);
+grid.position.y = 0.3;   // clear of the ground plane, still below the route line
+scene.add(grid);
+
+// SUMO (x, y) meters -> Three.js (x, 0, -y) so "up" in SUMO's top-down
+// view maps to "further away" on screen instead of flipping the scene.
+function toScene(x, y, z = 0) { return new THREE.Vector3(x, z, -y); }
+
+// The route is sent as one ordered, already-connected point sequence, so
+// a single Line strip has no seams/gaps to worry about — unlike drawing
+// each road edge separately, which needed junction-gap patching.
+const routeMat = new THREE.LineBasicMaterial({ color: 0xdfe8ff });
+let routeLine = null;
+function drawRoute(points) {
+  if (routeLine) scene.remove(routeLine);
+  const pts = points.map(([x, y]) => toScene(x, y, 1.0));
+  const geom = new THREE.BufferGeometry().setFromPoints(pts);
+  routeLine = new THREE.Line(geom, routeMat);
+  scene.add(routeLine);
+}
+
+// Simple car proxy: body + cabin, nose along +X (rotated to match heading).
+const car = new THREE.Group();
+const body = new THREE.Mesh(
+  new THREE.BoxGeometry(4.2, 1.2, 1.9),
+  new THREE.MeshStandardMaterial({ color: 0x35e0e0, emissive: 0x0a3a3a })
+);
+body.position.y = 0.7;
+const cabin = new THREE.Mesh(
+  new THREE.BoxGeometry(2.0, 0.9, 1.6),
+  new THREE.MeshStandardMaterial({ color: 0x1b2430 })
+);
+cabin.position.set(-0.3, 1.55, 0);
+car.add(body, cabin);
+car.visible = false;
+scene.add(car);
+
+let egoSeen = false;
+let egoHeading = 0;   // SUMO convention: 0 = east, CCW positive
+const CHASE_DIST = 30;    // behind the car, along its own heading
+const CHASE_HEIGHT = 18;  // above the car
+
+function animate() {
+  requestAnimationFrame(animate);
+  if (egoSeen) {
+    // Recomputed from the car's current heading every frame (not a fixed
+    // world-space offset), so the camera always sits directly behind the
+    // car and turns with it — the car reads as constantly driving away
+    // from the camera no matter which real-world direction it's facing.
+    const target = new THREE.Vector3(
+      car.position.x - CHASE_DIST * Math.cos(egoHeading),
+      CHASE_HEIGHT,
+      car.position.z + CHASE_DIST * Math.sin(egoHeading)
+    );
+    camera.position.lerp(target, 0.08);
+    controls.target.lerp(car.position, 0.2);
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ── WebSocket ────────────────────────────────────────────────────────────
+let ws = null;
+
+function connect() {
+  const host = document.getElementById("wsHost").value.trim();
+  if (ws) ws.close();
+  ws = new WebSocket("ws://" + host);
+  const statusEl = document.getElementById("status");
+
+  ws.onopen = () => { statusEl.textContent = "connected"; statusEl.className = "ok"; };
+  ws.onclose = () => { statusEl.textContent = "disconnected"; statusEl.className = "bad"; };
+  ws.onerror = () => { statusEl.textContent = "error"; statusEl.className = "bad"; };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === "route") {
+      drawRoute(msg.points);
+      // A new route recenters the origin server-side, so the previous
+      // ego position is stale until the next real update arrives.
+      egoSeen = false;
+      car.visible = false;
+    } else if (msg.type === "ego") {
+      car.visible = true;
+      egoSeen = true;
+      car.position.copy(toScene(msg.x, msg.y));
+      egoHeading = msg.heading;
+      // SUMO heading: 0 = east, CCW positive. Scene z is negated, so
+      // rotate the opposite way to keep the nose pointing the right way.
+      car.rotation.y = -msg.heading;
+      document.getElementById("speed").textContent = (msg.speed * 3.6).toFixed(1) + " km/h";
+      document.getElementById("pos").textContent = `x: ${msg.x.toFixed(1)}, y: ${msg.y.toFixed(1)}`;
+    }
+  };
+}
+
+document.getElementById("connectBtn").addEventListener("click", connect);
+connect();
+</script>
+</body>
+</html>

@@ -89,7 +89,7 @@ Click-to-Drive (S pin → E pin in viewer, SPACE to confirm)
 sudo apt install -y sumo sumo-tools
 
 # Python dependencies
-pip install osmnx "numpy<2" scikit-learn traci==1.12.0 sumolib==1.12.0 pygame requests
+pip install osmnx "numpy<2" scikit-learn traci==1.12.0 sumolib==1.12.0 pygame requests websockets
 ```
 
 ### Build
@@ -117,6 +117,16 @@ To run layers independently (e.g. for debugging one node at a time):
 ros2 launch ads_map map.launch.py
 ros2 launch ads_simulation simulation.launch.py use_gui:=false
 ```
+
+### Optional: 3D viewer
+
+`car3d_bridge` streams the ego's live position/heading and the road network geometry over a plain WebSocket, for a lightweight browser-based 3D view alongside the 2D Pygame viewer. Run it alongside the main stack:
+
+```bash
+ros2 run ads_simulation car3d_bridge
+```
+
+Then open `src/ads_simulation/web/car3d_viewer.html` directly in a browser (works over `file://`, no server needed) and connect to the bridge's `ws://` address shown in the page.
 
 ---
 
