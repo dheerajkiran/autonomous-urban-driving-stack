@@ -124,18 +124,80 @@ function offsetPolyline(points, offset) {
   });
 }
 
+// Lane shapes come in junction-free (see sumo_bridge) — real junctions are
+// 2D polygons, and their boundary isn't a clean continuation of a lane's
+// path, so extending into it turned earlier attempts into a tangled,
+// self-overlapping mess once widened into a surface. Instead, extend each
+// lane a fixed distance straight out along its own start/end direction —
+// pure linear extrapolation can never self-intersect, and since the
+// adjacent edge at a junction gets the same treatment, both surfaces
+// overlap enough in the junction area to visually close the gap.
+const LANE_EXTEND_M = 15;
+function extendEnds(points, dist) {
+  if (points.length < 2) return points;
+  const startDir = new THREE.Vector2(
+    points[1].x - points[0].x, points[1].z - points[0].z
+  ).normalize();
+  const endDir = new THREE.Vector2(
+    points[points.length - 1].x - points[points.length - 2].x,
+    points[points.length - 1].z - points[points.length - 2].z
+  ).normalize();
+  const startExt = new THREE.Vector3(
+    points[0].x - startDir.x * dist, points[0].y, points[0].z - startDir.y * dist
+  );
+  const endExt = new THREE.Vector3(
+    points[points.length - 1].x + endDir.x * dist,
+    points[points.length - 1].y,
+    points[points.length - 1].z + endDir.y * dist
+  );
+  return [startExt, ...points, endExt];
+}
+
+// Builds a road surface from a (possibly extended) centerline + width.
+// Each segment between consecutive points gets its own independent quad
+// from that segment's own local direction (so a single quad is always
+// well-formed), and the small wedge at each interior joint between two
+// differently-angled segments is filled with a connecting triangle fan —
+// the standard "bevel join" technique for offsetting a polyline. This
+// keeps the geometry itself robust even though the extension above is
+// what actually closes the inter-edge gaps.
 function buildLaneSurface(centerPts, width) {
-  const left = offsetPolyline(centerPts, width / 2);
-  const right = offsetPolyline(centerPts, -width / 2);
+  const half = width / 2;
   const positions = [];
+  const segLeftA = [], segRightA = [], segLeftB = [], segRightB = [];
+
   for (let i = 0; i < centerPts.length - 1; i++) {
-    const a = left[i], b = right[i], c = left[i + 1], d = right[i + 1];
-    positions.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
-    positions.push(b.x, b.y, b.z, d.x, d.y, d.z, c.x, c.y, c.z);
+    const p0 = centerPts[i], p1 = centerPts[i + 1];
+    const dir = new THREE.Vector2(p1.x - p0.x, p1.z - p0.z).normalize();
+    const n = new THREE.Vector2(-dir.y, dir.x);
+    const leftA  = new THREE.Vector3(p0.x + n.x * half, p0.y, p0.z + n.y * half);
+    const rightA = new THREE.Vector3(p0.x - n.x * half, p0.y, p0.z - n.y * half);
+    const leftB  = new THREE.Vector3(p1.x + n.x * half, p1.y, p1.z + n.y * half);
+    const rightB = new THREE.Vector3(p1.x - n.x * half, p1.y, p1.z - n.y * half);
+    segLeftA.push(leftA); segRightA.push(rightA);
+    segLeftB.push(leftB); segRightB.push(rightB);
+
+    positions.push(leftA.x, leftA.y, leftA.z, rightA.x, rightA.y, rightA.z, leftB.x, leftB.y, leftB.z);
+    positions.push(rightA.x, rightA.y, rightA.z, rightB.x, rightB.y, rightB.z, leftB.x, leftB.y, leftB.z);
   }
+
+  for (let i = 1; i < centerPts.length - 1; i++) {
+    const c = centerPts[i];
+    const pl = segLeftB[i - 1],  pr = segRightB[i - 1];
+    const nl = segLeftA[i],      nr = segRightA[i];
+    positions.push(c.x, c.y, c.z, pl.x, pl.y, pl.z, nl.x, nl.y, nl.z);
+    positions.push(c.x, c.y, c.z, nr.x, nr.y, nr.z, pr.x, pr.y, pr.z);
+  }
+
   const geom = new THREE.BufferGeometry();
   geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geom.computeVertexNormals();
+
+  // Boundary-marking lines keep the simpler per-point offset — a thin
+  // line's occasional minor kink at a sharp corner is far less visible
+  // than the hole/pinch it causes on a filled surface.
+  const left = offsetPolyline(centerPts, half);
+  const right = offsetPolyline(centerPts, -half);
   return { geom, left, right };
 }
 
@@ -177,8 +239,9 @@ function drawLanes(edgeGroups) {
   for (const group of edgeGroups) {
     const laneBoundaries = [];
     for (const lane of group.lanes) {
-      const centerPts = lane.shape.map(([x, y]) => toScene(x, y, 0.5));
+      let centerPts = lane.shape.map(([x, y]) => toScene(x, y, 0.5));
       if (centerPts.length < 2) continue;
+      centerPts = extendEnds(centerPts, LANE_EXTEND_M);
       const { geom, left, right } = buildLaneSurface(centerPts, lane.width);
       laneGroup.add(new THREE.Mesh(geom, laneSurfaceMat));
       laneBoundaries.push({ left, right });

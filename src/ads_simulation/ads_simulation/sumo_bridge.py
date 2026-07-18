@@ -376,15 +376,18 @@ class SumoBridge(Node):
             return {
                 "direction": direction,
                 "lanes": [
-                    # includeJunctions=True so adjacent edges' lane ribbons
-                    # actually meet at intersections — a filled surface with
-                    # a gap reads as visibly broken pavement, unlike the thin
-                    # route line where the same option caused zigzag corners
-                    # from tracing complex junction polygons, so it was left
-                    # off there. A zigzag corner is fine on a wide surface.
+                    # includeJunctions=False — a real junction is a 2D
+                    # polygon, not a clean continuation of the lane's path,
+                    # so treating its boundary as a 1D point sequence
+                    # doubles back on itself and produces a tangled,
+                    # self-overlapping mess once turned into a filled
+                    # surface. car3d_viewer instead extends each lane's own
+                    # straight-line direction a few meters past its true
+                    # endpoint to close the gap — simple linear
+                    # extrapolation that can never self-intersect.
                     {
                         "width": lane.getWidth(),
-                        "shape": [list(p) for p in lane.getShape(includeJunctions=True)],
+                        "shape": [list(p) for p in lane.getShape(includeJunctions=False)],
                     }
                     for lane in edge.getLanes()
                 ],
