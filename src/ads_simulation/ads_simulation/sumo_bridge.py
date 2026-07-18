@@ -32,10 +32,22 @@ Publishes
                                               Includes each route edge's paired opposite-direction
                                               edge if one exists. Raw SUMO x/y, not lat/lon — the
                                               2D viewer doesn't consume this.
+/navigation/route_buildings (std_msgs/String)  — JSON building footprints near the current
+                                                   route: {"buildings": [[[x,y], ...], ...]}.
+                                                   Fetched live from Overpass, scoped to a padded
+                                                   bounding box around the route — routes are
+                                                   picked interactively so there's no way to know
+                                                   which part of Tempe needs buildings ahead of
+                                                   time, and downloading the whole city's building
+                                                   footprints upfront is far more than any one
+                                                   route needs. Runs in a background thread so the
+                                                   network round-trip never blocks ego spawning.
+                                                   Raw SUMO x/y, for car3d_bridge only.
 """
 
 import json
 import math
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -58,6 +70,7 @@ class SumoBridge(Node):
         self.declare_parameter("publish_rate", 20.0)
         self.declare_parameter("use_gui", False)
         self.declare_parameter("edge_search_radius_m", 50.0)
+        self.declare_parameter("building_search_pad_deg", 0.0006)   # ~60m
 
         self._cache_dir    = Path(self.get_parameter("cache_dir").value).expanduser()
         self._net_filename = self.get_parameter("net_filename").value
@@ -66,6 +79,7 @@ class SumoBridge(Node):
         self._publish_rate = self.get_parameter("publish_rate").value
         self._use_gui      = self.get_parameter("use_gui").value
         self._edge_search_radius_m = self.get_parameter("edge_search_radius_m").value
+        self._building_pad_deg = self.get_parameter("building_search_pad_deg").value
 
         self._net_path = self._cache_dir / self._net_filename
         self._cfg_path = self._cache_dir / self._cfg_filename
@@ -74,6 +88,7 @@ class SumoBridge(Node):
         self._state_pub  = self.create_publisher(VehicleState, "/vehicle/state", 10)
         self._route_pub  = self.create_publisher(Route, "/navigation/route", 10)
         self._lanes_pub  = self.create_publisher(String, "/navigation/route_lanes", 10)
+        self._buildings_pub = self.create_publisher(String, "/navigation/route_buildings", 10)
 
         self._map_status_sub = self.create_subscription(
             String, "/map/status", self._on_map_status, 10
@@ -353,6 +368,82 @@ class SumoBridge(Node):
 
         self._route_pub.publish(route_msg)
         self._publish_route_lanes(edges)
+        self._publish_route_buildings(waypoints)
+
+    def _publish_route_buildings(self, waypoints: list) -> None:
+        """Kick off a background fetch of building footprints near the route.
+
+        Routes are picked interactively, so there's no way to know ahead of
+        time which part of Tempe needs buildings — this fetches live from
+        Overpass, scoped to a padded box around the route's own lat/lon
+        (already computed for the waypoints), rather than pre-downloading
+        every building in the city. Runs in a background thread: a live
+        HTTP round-trip done inline in this callback would stall ego
+        spawning for however long the request takes — the same class of
+        bug fixed earlier by not blocking on synchronous network/IO work
+        inside a ROS2 subscription callback.
+        """
+        lats = [wp.latitude for wp in waypoints]
+        lons = [wp.longitude for wp in waypoints]
+        pad = self._building_pad_deg
+        bbox = (min(lats) - pad, min(lons) - pad, max(lats) + pad, max(lons) + pad)
+        threading.Thread(
+            target=self._fetch_and_publish_buildings, args=(bbox,), daemon=True
+        ).start()
+
+    def _fetch_and_publish_buildings(self, bbox: tuple) -> None:
+        south, west, north, east = bbox
+        query = (
+            "[out:xml][timeout:30];"
+            f'way["building"]({south},{west},{north},{east});'
+            "(._;>;);"
+            "out body;"
+        )
+        try:
+            import requests
+            response = requests.post(
+                "https://overpass-api.de/api/interpreter",
+                data={"data": query},
+                headers={"User-Agent": "autonomous-driving-stack/0.1 (portfolio project)"},
+                timeout=30,
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            self.get_logger().warn(f"Building fetch failed (non-fatal): {exc}")
+            return
+
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(response.content)
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to parse building response: {exc}")
+            return
+
+        nodes = {}
+        for node in root.findall("node"):
+            try:
+                nodes[node.get("id")] = (float(node.get("lat")), float(node.get("lon")))
+            except (TypeError, ValueError):
+                continue
+
+        buildings = []
+        for way in root.findall("way"):
+            if not any(tag.get("k") == "building" for tag in way.findall("tag")):
+                continue
+            shape = []
+            for nd in way.findall("nd"):
+                latlon = nodes.get(nd.get("ref"))
+                if latlon is None:
+                    continue
+                x, y = self._net.convertLonLat2XY(latlon[1], latlon[0])
+                shape.append([x, y])
+            if len(shape) >= 3:
+                buildings.append(shape)
+
+        msg = String()
+        msg.data = json.dumps({"buildings": buildings})
+        self._buildings_pub.publish(msg)
+        self.get_logger().info(f"Fetched {len(buildings)} building footprints near route.")
 
     def _publish_route_lanes(self, edges: list) -> None:
         """Publish per-lane geometry for the current route, for car3d_bridge.

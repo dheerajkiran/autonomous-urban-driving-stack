@@ -290,6 +290,70 @@ function drawLanes(edgeGroups) {
   scene.add(laneGroup);
 }
 
+// ── Buildings ────────────────────────────────────────────────────────────
+// Note: the camera is a strict top-down view (see CHASE_OFFSET below), so
+// walls won't read as visible 3D volume from directly overhead — mostly
+// the roof caps will show, as colored footprint shapes. Built correctly
+// with real height regardless, so it holds up if the camera angle changes
+// later.
+const buildingMat = new THREE.MeshStandardMaterial({ color: 0x6b5f4f, side: THREE.DoubleSide });
+
+// Simple deterministic "random" height per building from its footprint's
+// first point, so buildings vary a bit (6-18m) without needing real
+// height data — polyconvert's default output doesn't carry it.
+function buildingHeight(shapePts) {
+  const seed = Math.abs(Math.round(shapePts[0].x * 7 + shapePts[0].z * 13));
+  return 6 + (seed % 12);
+}
+
+function buildBuildingWalls(footprintPts, height) {
+  const positions = [];
+  const n = footprintPts.length;
+  for (let i = 0; i < n; i++) {
+    const a = footprintPts[i];
+    const b = footprintPts[(i + 1) % n];
+    const a0 = new THREE.Vector3(a.x, 0, a.z);
+    const a1 = new THREE.Vector3(a.x, height, a.z);
+    const b0 = new THREE.Vector3(b.x, 0, b.z);
+    const b1 = new THREE.Vector3(b.x, height, b.z);
+    positions.push(a0.x, a0.y, a0.z, b0.x, b0.y, b0.z, a1.x, a1.y, a1.z);
+    positions.push(b0.x, b0.y, b0.z, b1.x, b1.y, b1.z, a1.x, a1.y, a1.z);
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geom.computeVertexNormals();
+  return geom;
+}
+
+// Roof cap via THREE.Shape/ShapeGeometry rather than manual fan
+// triangulation — building footprints can be non-convex, and ShapeGeometry
+// handles that correctly (earcut) where a naive fan from one interior
+// point wouldn't. ShapeGeometry lies flat in the local XY plane; rotating
+// -90° about X and translating maps it onto our XZ ground plane at the
+// given height — the -p.z below pre-compensates that rotation's sign flip
+// so the footprint doesn't end up mirrored.
+function buildBuildingRoof(footprintPts, height) {
+  const shape = new THREE.Shape(footprintPts.map((p) => new THREE.Vector2(p.x, -p.z)));
+  const geom = new THREE.ShapeGeometry(shape);
+  geom.rotateX(-Math.PI / 2);
+  geom.translate(0, height, 0);
+  return geom;
+}
+
+let buildingGroup = null;
+function drawBuildings(buildings) {
+  if (buildingGroup) scene.remove(buildingGroup);
+  buildingGroup = new THREE.Group();
+  for (const shape of buildings) {
+    const footprintPts = shape.map(([x, y]) => toScene(x, y, 0));
+    if (footprintPts.length < 3) continue;
+    const height = buildingHeight(footprintPts);
+    buildingGroup.add(new THREE.Mesh(buildBuildingWalls(footprintPts, height), buildingMat));
+    buildingGroup.add(new THREE.Mesh(buildBuildingRoof(footprintPts, height), buildingMat));
+  }
+  scene.add(buildingGroup);
+}
+
 // Simple car proxy: body + cabin, nose along +X (rotated to match heading).
 const car = new THREE.Group();
 const body = new THREE.Mesh(
@@ -357,6 +421,8 @@ function connect() {
       car.visible = false;
     } else if (msg.type === "lanes") {
       drawLanes(msg.edges);
+    } else if (msg.type === "buildings") {
+      drawBuildings(msg.buildings);
     } else if (msg.type === "ego") {
       car.visible = true;
       egoSeen = true;

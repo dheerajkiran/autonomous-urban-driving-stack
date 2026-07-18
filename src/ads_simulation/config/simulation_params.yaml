@@ -10,3 +10,5 @@ sumo_bridge:
     use_gui: false                      # sumo-gui not available on ARM64 — using custom Pygame viewer
     edge_search_radius_m: 150.0         # Max distance from an S/E pin to a candidate SUMO edge
                                          # (generous — map clicks rarely land exactly on-road)
+    building_search_pad_deg: 0.0006     # ~60m padding around the route when fetching nearby
+                                         # buildings from Overpass, for the 3D viewer

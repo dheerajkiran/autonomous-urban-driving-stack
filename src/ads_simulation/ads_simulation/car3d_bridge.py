@@ -15,9 +15,10 @@ both problems entirely.
 
 Subscribes
 ----------
-/navigation/route        (ads_interfaces/msg/Route)  — published by sumo_bridge on ego spawn
-/navigation/route_lanes  (std_msgs/String)  — JSON per-lane geometry for the same route
-/vehicle/state            (ads_interfaces/msg/VehicleState)
+/navigation/route            (ads_interfaces/msg/Route)  — published by sumo_bridge on ego spawn
+/navigation/route_lanes      (std_msgs/String)  — JSON per-lane geometry for the same route
+/navigation/route_buildings  (std_msgs/String)  — JSON building footprints near the same route
+/vehicle/state                (ads_interfaces/msg/VehicleState)
 
 Serves
 ------
@@ -25,6 +26,7 @@ ws://0.0.0.0:<ws_port>  — JSON messages, each also sent to a client on connect
   {"type": "route", "points": [[x,y], ...]}
   {"type": "lanes", "edges": [{"direction": "forward"|"reverse",
                                 "lanes": [{"width":, "shape": [[x,y], ...]}, ...]}]}
+  {"type": "buildings", "buildings": [[[x,y], ...], ...]}
   {"type": "ego", "x":, "y":, "heading":, "speed":}   — sent on every /vehicle/state update
 """
 
@@ -51,6 +53,7 @@ class Car3DBridge(Node):
         self._ws_clients: set = set()
         self._route_json: Optional[str] = None
         self._lanes_json: Optional[str] = None
+        self._buildings_json: Optional[str] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Recenter on the route's own start point rather than any city-wide
         # reference — keeps scene coordinates small regardless of where in
@@ -60,6 +63,7 @@ class Car3DBridge(Node):
         self.create_subscription(Route, "/navigation/route", self._on_route, 10)
         self.create_subscription(VehicleState, "/vehicle/state", self._on_state, 10)
         self.create_subscription(String, "/navigation/route_lanes", self._on_route_lanes, 10)
+        self.create_subscription(String, "/navigation/route_buildings", self._on_route_buildings, 10)
 
         threading.Thread(target=self._run_ws_server, daemon=True).start()
 
@@ -104,6 +108,21 @@ class Car3DBridge(Node):
         if self._loop is not None:
             asyncio.run_coroutine_threadsafe(self._broadcast(self._lanes_json), self._loop)
 
+    def _on_route_buildings(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        ox, oy = self._origin
+        buildings = [
+            [[x - ox, y - oy] for x, y in shape]
+            for shape in data.get("buildings", [])
+        ]
+        self._buildings_json = json.dumps({"type": "buildings", "buildings": buildings})
+
+        if self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._broadcast(self._buildings_json), self._loop)
+
     def _on_state(self, msg: VehicleState) -> None:
         if self._loop is None:
             return
@@ -145,6 +164,8 @@ class Car3DBridge(Node):
                     await websocket.send(self._route_json)
                 if self._lanes_json:
                     await websocket.send(self._lanes_json)
+                if self._buildings_json:
+                    await websocket.send(self._buildings_json)
                 async for _ in websocket:
                     pass   # no client -> server messages expected
             finally:
