@@ -355,20 +355,31 @@ function drawBuildings(buildings) {
 }
 
 // Simple car proxy: body + cabin, nose along +X (rotated to match heading).
-const car = new THREE.Group();
-const body = new THREE.Mesh(
-  new THREE.BoxGeometry(4.2, 1.2, 1.9),
-  new THREE.MeshStandardMaterial({ color: 0x35e0e0, emissive: 0x0a3a3a })
-);
-body.position.y = 0.7;
-const cabin = new THREE.Mesh(
-  new THREE.BoxGeometry(2.0, 0.9, 1.6),
-  new THREE.MeshStandardMaterial({ color: 0x1b2430 })
-);
-cabin.position.set(-0.3, 1.55, 0);
-car.add(body, cabin);
+function makeCar(bodyColor, emissiveColor) {
+  const group = new THREE.Group();
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(4.2, 1.2, 1.9),
+    new THREE.MeshStandardMaterial({ color: bodyColor, emissive: emissiveColor })
+  );
+  body.position.y = 0.7;
+  const cabin = new THREE.Mesh(
+    new THREE.BoxGeometry(2.0, 0.9, 1.6),
+    new THREE.MeshStandardMaterial({ color: 0x1b2430 })
+  );
+  cabin.position.set(-0.3, 1.55, 0);
+  group.add(body, cabin);
+  return group;
+}
+
+const car = makeCar(0x35e0e0, 0x0a3a3a);
 car.visible = false;
 scene.add(car);
+
+// Background traffic — one car mesh per vehicle id, added/removed/updated
+// to track whichever ids are present in each "traffic" message (vehicles
+// come and go as they finish their route).
+const TRAFFIC_COLOR = 0xff8a3d, TRAFFIC_EMISSIVE = 0x4a2405;
+const trafficCars = new Map();   // id -> THREE.Group
 
 let egoSeen = false;
 // Fixed world-space offset — camera translates to follow the car's
@@ -416,9 +427,11 @@ function connect() {
       // Not drawn — the wide lane surfaces from the "lanes" message are
       // the road itself; a separate thin route line on top is redundant.
       // A new route recenters the origin server-side, so the previous
-      // ego position is stale until the next real update arrives.
+      // ego/traffic positions are stale until fresh updates arrive.
       egoSeen = false;
       car.visible = false;
+      for (const mesh of trafficCars.values()) scene.remove(mesh);
+      trafficCars.clear();
     } else if (msg.type === "lanes") {
       drawLanes(msg.edges);
     } else if (msg.type === "buildings") {
@@ -436,6 +449,27 @@ function connect() {
       car.rotation.y = msg.heading;
       document.getElementById("speed").textContent = (msg.speed * 3.6).toFixed(1) + " km/h";
       document.getElementById("pos").textContent = `x: ${msg.x.toFixed(1)}, y: ${msg.y.toFixed(1)}`;
+    } else if (msg.type === "traffic") {
+      const seen = new Set();
+      for (const v of msg.vehicles) {
+        seen.add(v.id);
+        let mesh = trafficCars.get(v.id);
+        if (!mesh) {
+          mesh = makeCar(TRAFFIC_COLOR, TRAFFIC_EMISSIVE);
+          trafficCars.set(v.id, mesh);
+          scene.add(mesh);
+        }
+        mesh.position.copy(toScene(v.x, v.y, 0.5));
+        mesh.rotation.y = v.heading;
+      }
+      // Drop cars for ids no longer present — that vehicle finished its
+      // route and exited the network.
+      for (const [id, mesh] of trafficCars) {
+        if (!seen.has(id)) {
+          scene.remove(mesh);
+          trafficCars.delete(id);
+        }
+      }
     }
   };
 }

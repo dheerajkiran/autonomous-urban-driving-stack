@@ -43,6 +43,14 @@ Publishes
                                                    route needs. Runs in a background thread so the
                                                    network round-trip never blocks ego spawning.
                                                    Raw SUMO x/y, for car3d_bridge only.
+/navigation/traffic_vehicles (std_msgs/String)  — JSON state for background traffic, published
+                                                    every tick: {"vehicles": [{"id":, "x":, "y":,
+                                                    "heading":, "speed":}, ...]}. Spawned on the
+                                                    route's reverse-direction edges (concentrated
+                                                    near the ego, not ambient city-wide) so the
+                                                    two-way street car3d_viewer renders has real
+                                                    oncoming traffic on it. Raw SUMO x/y, for
+                                                    car3d_bridge only.
 """
 
 import json
@@ -71,6 +79,7 @@ class SumoBridge(Node):
         self.declare_parameter("use_gui", False)
         self.declare_parameter("edge_search_radius_m", 50.0)
         self.declare_parameter("building_search_pad_deg", 0.0006)   # ~60m
+        self.declare_parameter("background_traffic_count", 4)
 
         self._cache_dir    = Path(self.get_parameter("cache_dir").value).expanduser()
         self._net_filename = self.get_parameter("net_filename").value
@@ -80,6 +89,7 @@ class SumoBridge(Node):
         self._use_gui      = self.get_parameter("use_gui").value
         self._edge_search_radius_m = self.get_parameter("edge_search_radius_m").value
         self._building_pad_deg = self.get_parameter("building_search_pad_deg").value
+        self._background_traffic_count = self.get_parameter("background_traffic_count").value
 
         self._net_path = self._cache_dir / self._net_filename
         self._cfg_path = self._cache_dir / self._cfg_filename
@@ -89,6 +99,7 @@ class SumoBridge(Node):
         self._route_pub  = self.create_publisher(Route, "/navigation/route", 10)
         self._lanes_pub  = self.create_publisher(String, "/navigation/route_lanes", 10)
         self._buildings_pub = self.create_publisher(String, "/navigation/route_buildings", 10)
+        self._traffic_pub   = self.create_publisher(String, "/navigation/traffic_vehicles", 10)
 
         self._map_status_sub = self.create_subscription(
             String, "/map/status", self._on_map_status, 10
@@ -105,6 +116,7 @@ class SumoBridge(Node):
         self._net: Optional[object]   = None   # sumolib.net.Net, loaded once SUMO starts
         self._pending_goal: Optional[dict] = None
         self._route_counter = 0
+        self._traffic_veh_ids: list = []
 
         self._timer = self.create_timer(1.0 / self._publish_rate, self._tick)
 
@@ -322,6 +334,7 @@ class SumoBridge(Node):
             f"'{start_edge.getID()}' → '{end_edge.getID()}'."
         )
 
+        self._spawn_background_traffic(edges)
         self._publish_actual_route(edges, goal)
 
     def _publish_actual_route(self, edges: list, goal: dict) -> None:
@@ -445,6 +458,82 @@ class SumoBridge(Node):
         self._buildings_pub.publish(msg)
         self.get_logger().info(f"Fetched {len(buildings)} building footprints near route.")
 
+    def _reverse_edges(self, edges: list) -> list:
+        """Look up each edge's paired opposite-direction edge, in order.
+
+        Found by actual network topology — for edge A->B, the reverse is
+        whichever edge goes B->A, found by checking B's outgoing edges
+        directly — not by guessing an ID string like "-123". netconvert's
+        "123"/"-123" OSM two-way-street convention holds for a simple way,
+        but a long arterial split into multiple segments ("123#0", "123#1",
+        ...) doesn't necessarily mirror the same split points under the
+        same numbering on its reverse direction, so a same-ID-but-negated
+        guess can miss a real reverse edge that exists under a different
+        ID. A genuinely one-way street has no B->A edge at all, and is
+        skipped. Deduplicated and order-preserving, so callers that need a
+        connected reverse route (background traffic) can just reverse the
+        returned list.
+        """
+        result = []
+        seen_ids = set()
+        for edge in edges:
+            from_node, to_node = edge.getFromNode(), edge.getToNode()
+            reverse_edge = next(
+                (c for c in to_node.getOutgoing() if c.getToNode() == from_node),
+                None,
+            )
+            if reverse_edge is None or reverse_edge.getID() in seen_ids:
+                continue
+            seen_ids.add(reverse_edge.getID())
+            result.append(reverse_edge)
+        return result
+
+    def _spawn_background_traffic(self, edges: list) -> None:
+        """Spawn a few vehicles driving the opposite direction of the route.
+
+        Concentrated on the route rather than ambient across the network —
+        this is meant to populate the two-way street car3d_viewer already
+        renders with real oncoming traffic, not simulate city-wide demand.
+        Reversing the paired-edge list gives a route that's actually
+        connected: the ego goes edge1->edge2->edge3, so oncoming traffic
+        needs to enter where the ego's route ends and exit where it began,
+        i.e. reverse(edge3)->reverse(edge2)->reverse(edge1).
+        """
+        for vid in self._traffic_veh_ids:
+            try:
+                self._traci.vehicle.remove(vid)
+            except Exception:
+                pass   # already exited the network naturally
+        self._traffic_veh_ids = []
+
+        reverse_edges = list(reversed(self._reverse_edges(edges)))
+        if not reverse_edges:
+            self.get_logger().info(
+                "No reverse-direction edges for this route — "
+                "every edge is one-way, nothing to populate with oncoming traffic."
+            )
+            return
+
+        try:
+            route_id = f"traffic_route_{self._route_counter}"
+            self._traci.route.add(route_id, [e.getID() for e in reverse_edges])
+            for i in range(self._background_traffic_count):
+                vid = f"traffic_{self._route_counter}_{i}"
+                self._traci.vehicle.add(
+                    vid, route_id, departLane="random",
+                    departPos="random", departSpeed="max",
+                )
+                self._traci.vehicle.setSpeedMode(vid, 7)
+                self._traffic_veh_ids.append(vid)
+        except Exception as exc:
+            self.get_logger().error(f"Failed to spawn background traffic: {exc}")
+            return
+
+        self.get_logger().info(
+            f"Background traffic spawned — {len(self._traffic_veh_ids)} vehicles "
+            f"on {len(reverse_edges)} reverse edges."
+        )
+
     def _publish_route_lanes(self, edges: list) -> None:
         """Publish per-lane geometry for the current route, for car3d_bridge.
 
@@ -457,11 +546,10 @@ class SumoBridge(Node):
         Lanes are grouped by edge (not sent as one flat list) so the viewer
         can tell an internal divider between two lanes of the same edge
         apart from the road's outer edge. Each route edge's paired
-        opposite-direction edge is looked up and included too (marked
-        direction="reverse") so the full two-way street renders, not just
-        the single direction the ego is actually driving on — netconvert's
-        OSM two-way-street convention pairs edge "123" with "-123", which
-        this relies on; a genuinely one-way street simply has no pair.
+        opposite-direction edge (see _reverse_edges) is looked up and
+        included too (marked direction="reverse") so the full two-way
+        street renders, not just the single direction the ego is actually
+        driving on; a genuinely one-way street simply has no pair.
         """
         def edge_group(edge, direction: str) -> dict:
             return {
@@ -485,18 +573,7 @@ class SumoBridge(Node):
             }
 
         groups = [edge_group(edge, "forward") for edge in edges]
-
-        seen_reverse_ids = set()
-        for edge in edges:
-            eid = edge.getID()
-            reverse_id = eid[1:] if eid.startswith("-") else f"-{eid}"
-            if reverse_id in seen_reverse_ids:
-                continue
-            try:
-                reverse_edge = self._net.getEdge(reverse_id)
-            except KeyError:
-                continue
-            seen_reverse_ids.add(reverse_id)
+        for reverse_edge in self._reverse_edges(edges):
             groups.append(edge_group(reverse_edge, "reverse"))
 
         msg = String()
@@ -518,21 +595,27 @@ class SumoBridge(Node):
         try:
             self._traci.simulationStep()
             self._publish_ego_state()
+            self._publish_traffic_vehicles()
         except Exception as exc:
             self.get_logger().error(f"SUMO step failed: {exc}")
             self._sumo_running = False
+
+    @staticmethod
+    def _sumo_heading(angle_deg: float) -> float:
+        """SUMO's vehicle angle is degrees clockwise from north — convert to
+        radians, 0 = east, CCW positive (the convention every consumer of
+        vehicle state in this codebase, ego or traffic, expects)."""
+        return math.atan2(
+            math.sin(math.radians(90.0 - angle_deg)),
+            math.cos(math.radians(90.0 - angle_deg)),
+        )
 
     def _publish_ego_state(self) -> None:
         if "ego" not in self._traci.vehicle.getIDList():
             return
 
         x, y = self._traci.vehicle.getPosition("ego")
-        sumo_angle_deg = self._traci.vehicle.getAngle("ego")  # clockwise from north
-        # Convert to the message's convention: radians, 0 = east, CCW positive.
-        heading = math.atan2(
-            math.sin(math.radians(90.0 - sumo_angle_deg)),
-            math.cos(math.radians(90.0 - sumo_angle_deg)),
-        )
+        heading = self._sumo_heading(self._traci.vehicle.getAngle("ego"))
 
         msg = VehicleState()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -544,6 +627,37 @@ class SumoBridge(Node):
         msg.y = y
         msg.is_autonomous = True
         self._state_pub.publish(msg)
+
+    def _publish_traffic_vehicles(self) -> None:
+        """Publish live state for background traffic, for car3d_bridge.
+
+        Vehicles that have exited the network (finished their route) are
+        dropped from tracking here rather than needing the viewer to guess
+        when a car disappears.
+        """
+        if not self._traffic_veh_ids:
+            return
+
+        existing = set(self._traci.vehicle.getIDList())
+        still_alive = []
+        vehicles = []
+        for vid in self._traffic_veh_ids:
+            if vid not in existing:
+                continue
+            still_alive.append(vid)
+            x, y = self._traci.vehicle.getPosition(vid)
+            vehicles.append({
+                "id": vid,
+                "x": x,
+                "y": y,
+                "heading": self._sumo_heading(self._traci.vehicle.getAngle(vid)),
+                "speed": self._traci.vehicle.getSpeed(vid),
+            })
+        self._traffic_veh_ids = still_alive
+
+        msg = String()
+        msg.data = json.dumps({"vehicles": vehicles})
+        self._traffic_pub.publish(msg)
 
     def _publish_status(self, status: str) -> None:
         msg = String()

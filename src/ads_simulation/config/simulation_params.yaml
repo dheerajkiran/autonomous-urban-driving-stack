@@ -12,3 +12,5 @@ sumo_bridge:
                                          # (generous — map clicks rarely land exactly on-road)
     building_search_pad_deg: 0.0006     # ~60m padding around the route when fetching nearby
                                          # buildings from Overpass, for the 3D viewer
+    background_traffic_count: 4         # Vehicles spawned on the route's reverse-direction
+                                         # edges each time the ego spawns, for the 3D viewer
