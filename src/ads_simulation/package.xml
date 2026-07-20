@@ -6,9 +6,11 @@
   <description>
     SUMO-based simulation bridge for the Autonomous Driving Stack. Runs SUMO
     headless on the Tempe road network, resolves click-to-drive lat/lon goals
-    to SUMO edges, spawns and drives the ego vehicle, and publishes its state.
-    Also provides the Pygame OpenStreetMap viewer for route visualization and
-    click-to-drive pin placement.
+    to SUMO edges, spawns and drives the ego vehicle, spawns background
+    traffic on the route's reverse-direction edges, and publishes lane and
+    nearby-building geometry. Also provides the Pygame OpenStreetMap viewer
+    for click-to-drive pin placement, and a WebSocket bridge (car3d_bridge)
+    for a browser-based Three.js 3D viewer of the same route.
   </description>
   <maintainer email="denna@asu.edu">Dheeraj Kiran</maintainer>
   <license>MIT</license>
