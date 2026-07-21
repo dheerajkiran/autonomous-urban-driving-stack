@@ -78,11 +78,15 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.maxPolarAngle = Math.PI * 0.49;
 // Locked chase cam — always tracks the car at a fixed relative angle once
-// it's seen, so the view doesn't need to be manually aimed. Zoom (scroll)
-// still works for adjusting distance; drag-to-rotate is disabled so the
-// view can't be knocked off the car.
+// it's seen, so the view doesn't need to be manually aimed. Drag-to-rotate
+// and pan are disabled so the view can't be knocked off the car.
+// OrbitControls' own zoom is disabled too — it works by adjusting
+// camera.position, but animate() below re-derives camera.position from
+// the car every frame, so OrbitControls' zoom would just get overridden a
+// frame later. Zoom is instead driven by CHASE_HEIGHT further down.
 controls.enableRotate = false;
 controls.enablePan = false;
+controls.enableZoom = false;
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.55));
 const sun = new THREE.DirectionalLight(0xffffff, 0.8);
@@ -382,21 +386,35 @@ const TRAFFIC_COLOR = 0xff8a3d, TRAFFIC_EMISSIVE = 0x4a2405;
 const trafficCars = new Map();   // id -> THREE.Group
 
 let egoSeen = false;
-// Fixed world-space offset — camera translates to follow the car's
-// position but does not rotate with its heading. A turning car should
-// visibly change screen-direction; the camera holding a constant angle
-// is what makes that turn readable, rather than the camera swinging to
-// keep the car always "facing away," which looks disorienting mid-turn.
-// Purely vertical: straight top-down, not an isometric/angled chase view.
-const CHASE_OFFSET = new THREE.Vector3(0.01, 45, 0);
+// Camera translates to follow the car's position but does not rotate with
+// its heading. A turning car should visibly change screen-direction; the
+// camera holding a constant angle is what makes that turn readable,
+// rather than the camera swinging to keep the car always "facing away,"
+// which looks disorienting mid-turn. Purely vertical offset: straight
+// top-down, not an isometric/angled chase view.
+//
+// CHASE_HEIGHT is mutable (scroll wheel) rather than a fixed constant —
+// animate() re-derives camera.position from it every frame, so this is
+// the only thing that actually changes the zoomed-in/out distance.
+let CHASE_HEIGHT = 45;
+const CHASE_HEIGHT_MIN = 12;
+const CHASE_HEIGHT_MAX = 300;
+
+renderer.domElement.addEventListener("wheel", (event) => {
+  event.preventDefault();
+  const scaled = CHASE_HEIGHT * (1 + Math.sign(event.deltaY) * 0.1);
+  CHASE_HEIGHT = Math.min(CHASE_HEIGHT_MAX, Math.max(CHASE_HEIGHT_MIN, scaled));
+}, { passive: false });
 
 function animate() {
   requestAnimationFrame(animate);
-  if (egoSeen) {
-    const target = car.position.clone().add(CHASE_OFFSET);
-    camera.position.lerp(target, 0.08);
-    controls.target.lerp(car.position, 0.2);
-  }
+  // Before the ego spawns, follow the scene origin (routes are recentered
+  // near it) instead of the car, so zoom works the same way while
+  // previewing a route as it does once the ego is actually driving.
+  const followPoint = egoSeen ? car.position : new THREE.Vector3(0, 0, 0);
+  const target = followPoint.clone().add(new THREE.Vector3(0.01, CHASE_HEIGHT, 0));
+  camera.position.lerp(target, 0.08);
+  controls.target.lerp(followPoint, 0.2);
   controls.update();
   renderer.render(scene, camera);
 }
