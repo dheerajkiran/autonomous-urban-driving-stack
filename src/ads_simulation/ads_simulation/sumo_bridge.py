@@ -79,6 +79,7 @@ class SumoBridge(Node):
         self.declare_parameter("use_gui", False)
         self.declare_parameter("edge_search_radius_m", 50.0)
         self.declare_parameter("building_search_pad_deg", 0.0006)   # ~60m
+        self.declare_parameter("road_context_pad_m", 450.0)
         self.declare_parameter("background_traffic_count", 4)
 
         self._cache_dir    = Path(self.get_parameter("cache_dir").value).expanduser()
@@ -89,6 +90,7 @@ class SumoBridge(Node):
         self._use_gui      = self.get_parameter("use_gui").value
         self._edge_search_radius_m = self.get_parameter("edge_search_radius_m").value
         self._building_pad_deg = self.get_parameter("building_search_pad_deg").value
+        self._road_context_pad_m = self.get_parameter("road_context_pad_m").value
         self._background_traffic_count = self.get_parameter("background_traffic_count").value
 
         self._net_path = self._cache_dir / self._net_filename
@@ -335,9 +337,9 @@ class SumoBridge(Node):
         )
 
         self._spawn_background_traffic(edges)
-        self._publish_actual_route(edges, goal)
+        self._publish_actual_route(edges, goal, spawn=True)
 
-    def _publish_actual_route(self, edges: list, goal: dict) -> None:
+    def _publish_actual_route(self, edges: list, goal: dict, spawn: bool = False) -> None:
         """Publish the ego's real SUMO edge path as the displayed route.
 
         route_planner's OSM A* preview and this edge path come from two
@@ -345,6 +347,13 @@ class SumoBridge(Node):
         so they can legitimately pick different streets for the same start/end.
         Overwriting /navigation/route with the path SUMO will actually drive
         keeps what the viewer draws honest about what happens.
+
+        `spawn` gates the building fetch specifically — unlike the route/lane
+        publish (cheap, purely local, fine to redo on every pin adjustment
+        before the user commits), it's a live Overpass HTTP call. Firing one
+        on every preview update hammers Overpass hard enough while testing
+        multiple routes in quick succession to get rate-limited (429) or
+        time out (504) — so it only runs once the ego actually spawns.
         """
         waypoints = []
         for i, edge in enumerate(edges):
@@ -381,7 +390,8 @@ class SumoBridge(Node):
 
         self._route_pub.publish(route_msg)
         self._publish_route_lanes(edges)
-        self._publish_route_buildings(waypoints)
+        if spawn:
+            self._publish_route_buildings(waypoints)
 
     def _publish_route_buildings(self, waypoints: list) -> None:
         """Kick off a background fetch of building footprints near the route.
@@ -407,7 +417,7 @@ class SumoBridge(Node):
     def _fetch_and_publish_buildings(self, bbox: tuple) -> None:
         south, west, north, east = bbox
         query = (
-            "[out:xml][timeout:30];"
+            "[out:xml][timeout:60];"
             f'way["building"]({south},{west},{north},{east});'
             "(._;>;);"
             "out body;"
@@ -418,7 +428,7 @@ class SumoBridge(Node):
                 "https://overpass-api.de/api/interpreter",
                 data={"data": query},
                 headers={"User-Agent": "autonomous-driving-stack/0.1 (portfolio project)"},
-                timeout=30,
+                timeout=60,
             )
             response.raise_for_status()
         except Exception as exc:
@@ -534,8 +544,32 @@ class SumoBridge(Node):
             f"on {len(reverse_edges)} reverse edges."
         )
 
+    def _nearby_drivable_edges(self, edges: list, pad_m: float) -> list:
+        """All drivable edges within a padded bounding box around a set of
+        edges — the road network is already fully loaded locally (unlike
+        buildings, no live fetch needed), so this is just a bounding-box
+        scan over sumolib's own edge list."""
+        xs, ys = [], []
+        for edge in edges:
+            for x, y in edge.getShape():
+                xs.append(x)
+                ys.append(y)
+        xmin, xmax = min(xs) - pad_m, max(xs) + pad_m
+        ymin, ymax = min(ys) - pad_m, max(ys) + pad_m
+
+        return [
+            e for e in self._net.getEdges()
+            if e.allows("passenger") and not e.getID().startswith(":")
+            and any(xmin <= x <= xmax and ymin <= y <= ymax for x, y in e.getShape())
+        ]
+
     def _publish_route_lanes(self, edges: list) -> None:
-        """Publish per-lane geometry for the current route, for car3d_bridge.
+        """Publish per-lane geometry for car3d_bridge — not just the ego's
+        own route, but every drivable edge in the surrounding area, the
+        same way _publish_route_buildings shows nearby buildings rather
+        than only ones the route directly touches. This is purely visual
+        context: it doesn't change ego routing/driving at all, which still
+        only ever uses `edges` (the actual route) elsewhere.
 
         The ego's real TraCI position is already laterally correct for
         whichever lane it's actually in — this is purely about giving the 3D
@@ -545,11 +579,10 @@ class SumoBridge(Node):
 
         Lanes are grouped by edge (not sent as one flat list) so the viewer
         can tell an internal divider between two lanes of the same edge
-        apart from the road's outer edge. Each route edge's paired
+        apart from the road's outer edge. Each edge's paired
         opposite-direction edge (see _reverse_edges) is looked up and
-        included too (marked direction="reverse") so the full two-way
-        street renders, not just the single direction the ego is actually
-        driving on; a genuinely one-way street simply has no pair.
+        included too (marked direction="reverse") so two-way streets
+        render fully; a genuinely one-way street simply has no pair.
         """
         def edge_group(edge, direction: str) -> dict:
             return {
@@ -572,13 +605,23 @@ class SumoBridge(Node):
                 ],
             }
 
-        groups = [edge_group(edge, "forward") for edge in edges]
-        for reverse_edge in self._reverse_edges(edges):
-            groups.append(edge_group(reverse_edge, "reverse"))
+        context_edges = self._nearby_drivable_edges(edges, self._road_context_pad_m)
+        reverse_edges = self._reverse_edges(context_edges)
+        reverse_ids = {e.getID() for e in reverse_edges}
+
+        seen_ids = set()
+        groups = []
+        for edge in context_edges + reverse_edges:
+            if edge.getID() in seen_ids:
+                continue
+            seen_ids.add(edge.getID())
+            direction = "reverse" if edge.getID() in reverse_ids else "forward"
+            groups.append(edge_group(edge, direction))
 
         msg = String()
         msg.data = json.dumps({"edges": groups})
         self._lanes_pub.publish(msg)
+        self.get_logger().info(f"Road context published — {len(groups)} edges.")
 
     def _stop_sumo(self) -> None:
         if self._sumo_running and self._traci is not None:
