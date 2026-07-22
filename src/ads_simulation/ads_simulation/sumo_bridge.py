@@ -43,18 +43,24 @@ Publishes
                                                    route needs. Runs in a background thread so the
                                                    network round-trip never blocks ego spawning.
                                                    Raw SUMO x/y, for car3d_bridge only.
-/navigation/traffic_vehicles (std_msgs/String)  — JSON state for background traffic, published
+/navigation/traffic_vehicles (std_msgs/String)  — JSON state for ambient traffic, published
                                                     every tick: {"vehicles": [{"id":, "x":, "y":,
-                                                    "heading":, "speed":}, ...]}. Spawned on the
-                                                    route's reverse-direction edges (concentrated
-                                                    near the ego, not ambient city-wide) so the
-                                                    two-way street car3d_viewer renders has real
-                                                    oncoming traffic on it. Raw SUMO x/y, for
-                                                    car3d_bridge only.
+                                                    "heading":, "speed":}, ...]}. Hundreds of
+                                                    vehicles are spawned/replenished on random
+                                                    origin/destination pairs across the whole
+                                                    network (_replenish_ambient_traffic) for a
+                                                    genuinely city-scale feel, but only whichever
+                                                    of them are currently within road_context_pad_m
+                                                    of the ego's live position are included here —
+                                                    car3d_viewer's software-rendered WebGL can't
+                                                    afford hundreds of rendered cars regardless of
+                                                    how many actually exist in the simulation.
+                                                    Raw SUMO x/y, for car3d_bridge only.
 """
 
 import json
 import math
+import random
 import threading
 from pathlib import Path
 from typing import Optional
@@ -80,7 +86,8 @@ class SumoBridge(Node):
         self.declare_parameter("edge_search_radius_m", 50.0)
         self.declare_parameter("building_search_pad_deg", 0.0006)   # ~60m
         self.declare_parameter("road_context_pad_m", 450.0)
-        self.declare_parameter("background_traffic_count", 4)
+        self.declare_parameter("ambient_traffic_count", 300)
+        self.declare_parameter("ambient_spawn_batch", 10)
 
         self._cache_dir    = Path(self.get_parameter("cache_dir").value).expanduser()
         self._net_filename = self.get_parameter("net_filename").value
@@ -91,7 +98,8 @@ class SumoBridge(Node):
         self._edge_search_radius_m = self.get_parameter("edge_search_radius_m").value
         self._building_pad_deg = self.get_parameter("building_search_pad_deg").value
         self._road_context_pad_m = self.get_parameter("road_context_pad_m").value
-        self._background_traffic_count = self.get_parameter("background_traffic_count").value
+        self._ambient_traffic_count = self.get_parameter("ambient_traffic_count").value
+        self._ambient_spawn_batch = self.get_parameter("ambient_spawn_batch").value
 
         self._net_path = self._cache_dir / self._net_filename
         self._cfg_path = self._cache_dir / self._cfg_filename
@@ -116,11 +124,17 @@ class SumoBridge(Node):
         self._sumo_running: bool      = False
         self._traci: Optional[object] = None
         self._net: Optional[object]   = None   # sumolib.net.Net, loaded once SUMO starts
+        self._all_drivable_edges: Optional[list] = None   # cached once, on net load
         self._pending_goal: Optional[dict] = None
         self._route_counter = 0
-        self._traffic_veh_ids: list = []
+        self._ambient_counter = 0
 
         self._timer = self.create_timer(1.0 / self._publish_rate, self._tick)
+        # Separate, slower timer — ambient traffic is city-wide and
+        # independent of whatever route the ego is on, so it doesn't need
+        # the main 50Hz simulation tick's cadence, and routing a batch of
+        # new vehicles is too much work to redo that often anyway.
+        self._ambient_timer = self.create_timer(2.0, self._replenish_ambient_traffic)
 
         self.get_logger().info(
             f"SumoBridge initialized — net='{self._net_path}', "
@@ -252,6 +266,10 @@ class SumoBridge(Node):
             return False
         try:
             self._net = sumolib.net.readNet(str(self._net_path))
+            self._all_drivable_edges = [
+                e for e in self._net.getEdges()
+                if e.allows("passenger") and not e.getID().startswith(":")
+            ]
             return True
         except Exception as exc:
             self.get_logger().error(f"Failed to load SUMO network for routing: {exc}")
@@ -336,7 +354,6 @@ class SumoBridge(Node):
             f"'{start_edge.getID()}' → '{end_edge.getID()}'."
         )
 
-        self._spawn_background_traffic(edges)
         self._publish_actual_route(edges, goal, spawn=True)
 
     def _publish_actual_route(self, edges: list, goal: dict, spawn: bool = False) -> None:
@@ -498,51 +515,59 @@ class SumoBridge(Node):
             result.append(reverse_edge)
         return result
 
-    def _spawn_background_traffic(self, edges: list) -> None:
-        """Spawn a few vehicles driving the opposite direction of the route.
-
-        Concentrated on the route rather than ambient across the network —
-        this is meant to populate the two-way street car3d_viewer already
-        renders with real oncoming traffic, not simulate city-wide demand.
-        Reversing the paired-edge list gives a route that's actually
-        connected: the ego goes edge1->edge2->edge3, so oncoming traffic
-        needs to enter where the ego's route ends and exit where it began,
-        i.e. reverse(edge3)->reverse(edge2)->reverse(edge1).
+    def _replenish_ambient_traffic(self) -> None:
+        """Keep a steady ambient vehicle count spread across the whole
+        network, independent of whatever route the ego is on — random
+        origin/destination edge pairs, routed with the same sumolib
+        getShortestPath used for the ego, so a genuinely city-scale traffic
+        feel rather than only near the ego's own route. Vehicles that
+        finish their random trip exit the network naturally and get
+        replaced here; car3d_bridge only ever sees whichever of these end
+        up near the ego at a given moment (see _publish_traffic_vehicles) —
+        rendering all of them regardless of distance isn't something this
+        3D viewer, running on software-rendered WebGL, can afford at a
+        target count in the hundreds.
         """
-        for vid in self._traffic_veh_ids:
-            try:
-                self._traci.vehicle.remove(vid)
-            except Exception:
-                pass   # already exited the network naturally
-        self._traffic_veh_ids = []
-
-        reverse_edges = list(reversed(self._reverse_edges(edges)))
-        if not reverse_edges:
-            self.get_logger().info(
-                "No reverse-direction edges for this route — "
-                "every edge is one-way, nothing to populate with oncoming traffic."
-            )
+        if not self._sumo_running or not self._all_drivable_edges:
             return
 
-        try:
-            route_id = f"traffic_route_{self._route_counter}"
-            self._traci.route.add(route_id, [e.getID() for e in reverse_edges])
-            for i in range(self._background_traffic_count):
-                vid = f"traffic_{self._route_counter}_{i}"
-                self._traci.vehicle.add(
-                    vid, route_id, departLane="random",
-                    departPos="random", departSpeed="max",
-                )
-                self._traci.vehicle.setSpeedMode(vid, 7)
-                self._traffic_veh_ids.append(vid)
-        except Exception as exc:
-            self.get_logger().error(f"Failed to spawn background traffic: {exc}")
-            return
-
-        self.get_logger().info(
-            f"Background traffic spawned — {len(self._traffic_veh_ids)} vehicles "
-            f"on {len(reverse_edges)} reverse edges."
+        current = sum(
+            1 for v in self._traci.vehicle.getIDList() if v.startswith("ambient_")
         )
+        to_spawn = min(self._ambient_spawn_batch, self._ambient_traffic_count - current)
+        if to_spawn <= 0:
+            return
+
+        spawned = 0
+        for _ in range(to_spawn):
+            for _attempt in range(5):
+                origin = random.choice(self._all_drivable_edges)
+                dest = random.choice(self._all_drivable_edges)
+                if origin.getID() == dest.getID():
+                    continue
+                path, _cost = self._net.getShortestPath(origin, dest, vClass="passenger")
+                if path is None:
+                    continue
+
+                self._ambient_counter += 1
+                vid = f"ambient_{self._ambient_counter}"
+                try:
+                    route_id = f"ambient_route_{self._ambient_counter}"
+                    self._traci.route.add(route_id, [e.getID() for e in path])
+                    self._traci.vehicle.add(
+                        vid, route_id, departLane="random", departSpeed="max",
+                    )
+                    self._traci.vehicle.setSpeedMode(vid, 7)
+                    spawned += 1
+                except Exception:
+                    pass   # route/vehicle add failed for this attempt — skip it
+                break
+
+        if spawned:
+            self.get_logger().info(
+                f"Ambient traffic replenished — +{spawned}, "
+                f"{current + spawned}/{self._ambient_traffic_count} total."
+            )
 
     def _nearby_drivable_edges(self, edges: list, pad_m: float) -> list:
         """All drivable edges within a padded bounding box around a set of
@@ -558,9 +583,8 @@ class SumoBridge(Node):
         ymin, ymax = min(ys) - pad_m, max(ys) + pad_m
 
         return [
-            e for e in self._net.getEdges()
-            if e.allows("passenger") and not e.getID().startswith(":")
-            and any(xmin <= x <= xmax and ymin <= y <= ymax for x, y in e.getShape())
+            e for e in self._all_drivable_edges
+            if any(xmin <= x <= xmax and ymin <= y <= ymax for x, y in e.getShape())
         ]
 
     def _publish_route_lanes(self, edges: list) -> None:
@@ -672,23 +696,32 @@ class SumoBridge(Node):
         self._state_pub.publish(msg)
 
     def _publish_traffic_vehicles(self) -> None:
-        """Publish live state for background traffic, for car3d_bridge.
+        """Publish live state for whichever ambient traffic is currently
+        near the ego, for car3d_bridge.
 
-        Vehicles that have exited the network (finished their route) are
-        dropped from tracking here rather than needing the viewer to guess
-        when a car disappears.
+        Ambient traffic is spawned city-wide (_replenish_ambient_traffic)
+        and SUMO tracks its lifecycle on its own — nothing here needs to
+        remember vehicle ids across calls, unlike the old route-concentrated
+        design. What this does need to do is filter to a bounded radius
+        around the ego's *current* position (not the whole route's
+        bounding box, which is what lanes/buildings use) — traffic is
+        continuously moving and the ego is continuously moving along a
+        route that can span kilometers, so "nearby" has to be relative to
+        where the ego actually is right now, not a static area computed
+        once back when the route was published.
         """
-        if not self._traffic_veh_ids:
+        if "ego" not in self._traci.vehicle.getIDList():
             return
+        ego_x, ego_y = self._traci.vehicle.getPosition("ego")
+        pad = self._road_context_pad_m
 
-        existing = set(self._traci.vehicle.getIDList())
-        still_alive = []
         vehicles = []
-        for vid in self._traffic_veh_ids:
-            if vid not in existing:
+        for vid in self._traci.vehicle.getIDList():
+            if vid == "ego":
                 continue
-            still_alive.append(vid)
             x, y = self._traci.vehicle.getPosition(vid)
+            if abs(x - ego_x) > pad or abs(y - ego_y) > pad:
+                continue
             vehicles.append({
                 "id": vid,
                 "x": x,
@@ -696,7 +729,6 @@ class SumoBridge(Node):
                 "heading": self._sumo_heading(self._traci.vehicle.getAngle(vid)),
                 "speed": self._traci.vehicle.getSpeed(vid),
             })
-        self._traffic_veh_ids = still_alive
 
         msg = String()
         msg.data = json.dumps({"vehicles": vehicles})
