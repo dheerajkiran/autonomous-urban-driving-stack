@@ -60,9 +60,9 @@ scene.fog = new THREE.Fog(0x111318, 200, 1500);
 
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.5, 4000);
 // Straight-down default (a tiny X epsilon avoids the gimbal singularity
-// of sitting exactly on the up-axis) so a newly received route is visible
-// immediately, before the ego has spawned and the chase camera has a
-// target — matches the straight-down chase angle below.
+// of sitting exactly on the up-axis) — OrbitControls treats this as its
+// starting angle/distance, and the user can then drag to tilt away from
+// it themselves (see the OrbitControls setup below).
 camera.position.set(0.01, 300, 0);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -76,17 +76,18 @@ document.body.appendChild(renderer.domElement);
 const controls = new THREE.OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
-controls.maxPolarAngle = Math.PI * 0.49;
-// Locked chase cam — always tracks the car at a fixed relative angle once
-// it's seen, so the view doesn't need to be manually aimed. Drag-to-rotate
-// and pan are disabled so the view can't be knocked off the car.
-// OrbitControls' own zoom is disabled too — it works by adjusting
-// camera.position, but animate() below re-derives camera.position from
-// the car every frame, so OrbitControls' zoom would just get overridden a
-// frame later. Zoom is instead driven by CHASE_HEIGHT further down.
-controls.enableRotate = false;
+controls.maxPolarAngle = Math.PI * 0.49;   // stop just short of the horizon
+// controls.target is moved to follow the car every frame (see animate()
+// below), and that's the *only* thing driving the camera — OrbitControls'
+// own update() repositions the camera relative to that moving target using
+// whatever angle/distance the user has interactively set via drag/scroll.
+// (An earlier version manually recomputed camera.position from a fixed
+// formula every frame instead, which silently fought and overrode any
+// drag or zoom the user tried — OrbitControls already does exactly this
+// job, so let it.) Pan stays disabled so the view can't drift off the car.
+controls.enableRotate = true;
 controls.enablePan = false;
-controls.enableZoom = false;
+controls.enableZoom = true;
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.55));
 const sun = new THREE.DirectionalLight(0xffffff, 0.8);
@@ -387,33 +388,21 @@ const trafficCars = new Map();   // id -> THREE.Group
 
 let egoSeen = false;
 // Camera translates to follow the car's position but does not rotate with
-// its heading. A turning car should visibly change screen-direction; the
-// camera holding a constant angle is what makes that turn readable,
-// rather than the camera swinging to keep the car always "facing away,"
-// which looks disorienting mid-turn. Purely vertical offset: straight
-// top-down, not an isometric/angled chase view.
-//
-// CHASE_HEIGHT is mutable (scroll wheel) rather than a fixed constant —
-// animate() re-derives camera.position from it every frame, so this is
-// the only thing that actually changes the zoomed-in/out distance.
-let CHASE_HEIGHT = 45;
-const CHASE_HEIGHT_MIN = 12;
-const CHASE_HEIGHT_MAX = 300;
-
-renderer.domElement.addEventListener("wheel", (event) => {
-  event.preventDefault();
-  const scaled = CHASE_HEIGHT * (1 + Math.sign(event.deltaY) * 0.1);
-  CHASE_HEIGHT = Math.min(CHASE_HEIGHT_MAX, Math.max(CHASE_HEIGHT_MIN, scaled));
-}, { passive: false });
+// its heading — a turning car should visibly change screen-direction, the
+// camera holding a constant angle is what makes that turn readable, rather
+// than the camera swinging to keep the car always "facing away," which
+// looks disorienting mid-turn. Rotate/zoom around that translating point
+// are entirely OrbitControls' own job now (drag/scroll) — only the
+// following itself is manual.
+controls.minDistance = 12;
+controls.maxDistance = 400;
 
 function animate() {
   requestAnimationFrame(animate);
   // Before the ego spawns, follow the scene origin (routes are recentered
-  // near it) instead of the car, so zoom works the same way while
-  // previewing a route as it does once the ego is actually driving.
+  // near it) instead of the car, so the view already tracks correctly
+  // while previewing a route, before the ego actually exists to follow.
   const followPoint = egoSeen ? car.position : new THREE.Vector3(0, 0, 0);
-  const target = followPoint.clone().add(new THREE.Vector3(0.01, CHASE_HEIGHT, 0));
-  camera.position.lerp(target, 0.08);
   controls.target.lerp(followPoint, 0.2);
   controls.update();
   renderer.render(scene, camera);
