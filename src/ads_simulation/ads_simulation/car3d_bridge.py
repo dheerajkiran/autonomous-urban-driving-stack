@@ -26,7 +26,8 @@ Serves
 ws://0.0.0.0:<ws_port>  — JSON messages, each also sent to a client on connect if available:
   {"type": "route", "points": [[x,y], ...]}
   {"type": "lanes", "edges": [{"direction": "forward"|"reverse",
-                                "lanes": [{"width":, "shape": [[x,y], ...]}, ...]}]}
+                                "lanes": [{"width":, "shape": [[x,y], ...]}, ...]}],
+                     "junctions": [{"shape": [[x,y], ...]}, ...]}
   {"type": "buildings", "buildings": [[[x,y], ...], ...]}
   {"type": "ego", "x":, "y":, "heading":, "speed":}   — sent on every /vehicle/state update
   {"type": "traffic", "vehicles": [{"id":, "x":, "y":, "heading":, "speed":}, ...]}
@@ -107,7 +108,11 @@ class Car3DBridge(Node):
             }
             for edge in data.get("edges", [])
         ]
-        self._lanes_json = json.dumps({"type": "lanes", "edges": edges})
+        junctions = [
+            {"shape": [[x - ox, y - oy] for x, y in j["shape"]]}
+            for j in data.get("junctions", [])
+        ]
+        self._lanes_json = json.dumps({"type": "lanes", "edges": edges, "junctions": junctions})
 
         if self._loop is not None:
             asyncio.run_coroutine_threadsafe(self._broadcast(self._lanes_json), self._loop)

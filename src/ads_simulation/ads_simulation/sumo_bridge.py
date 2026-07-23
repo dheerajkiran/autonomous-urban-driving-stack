@@ -587,6 +587,37 @@ class SumoBridge(Node):
             if any(xmin <= x <= xmax and ymin <= y <= ymax for x, y in e.getShape())
         ]
 
+    @staticmethod
+    def _junction_patch_shape(node, margin_m: float = 2.0, points: int = 10) -> list:
+        """Real junction polygon if one exists, else a small synthetic
+        circle at the node's actual location — every node where two edges
+        meet needs *some* patch shape, real intersection or not.
+
+        The circle's radius is sized to the widest edge actually connected
+        to this node (half its total lane width, plus a margin), not a flat
+        constant — a fixed small radius left a real-world lane-count change
+        (e.g. a road going from 1 to 3 lanes) poking out past the patch as
+        a visible rectangular step, since the patch wasn't wide enough to
+        cover the wider edge in the first place.
+        """
+        real_shape = node.getShape()
+        if real_shape:
+            return [list(p) for p in real_shape]
+
+        connected = list(node.getIncoming()) + list(node.getOutgoing())
+        half_widths = [
+            sum(lane.getWidth() for lane in edge.getLanes()) / 2.0
+            for edge in connected
+        ]
+        radius = (max(half_widths) if half_widths else 3.0) + margin_m
+
+        cx, cy = node.getCoord()
+        return [
+            [cx + radius * math.cos(2 * math.pi * i / points),
+             cy + radius * math.sin(2 * math.pi * i / points)]
+            for i in range(points)
+        ]
+
     def _publish_route_lanes(self, edges: list) -> None:
         """Publish per-lane geometry for car3d_bridge — not just the ego's
         own route, but every drivable edge in the surrounding area, the
@@ -617,10 +648,12 @@ class SumoBridge(Node):
                     # so treating its boundary as a 1D point sequence
                     # doubles back on itself and produces a tangled,
                     # self-overlapping mess once turned into a filled
-                    # surface. car3d_viewer instead extends each lane's own
-                    # straight-line direction a few meters past its true
-                    # endpoint to close the gap — simple linear
-                    # extrapolation that can never self-intersect.
+                    # surface. Junction polygons are sent separately below
+                    # and rendered as their own patch instead — geometrically
+                    # correct regardless of how sharply the road turns there,
+                    # unlike car3d_viewer's old straight-line extrapolation
+                    # hack, which only worked where a road kept going roughly
+                    # straight through the intersection.
                     {
                         "width": lane.getWidth(),
                         "shape": [list(p) for p in lane.getShape(includeJunctions=False)],
@@ -635,17 +668,41 @@ class SumoBridge(Node):
 
         seen_ids = set()
         groups = []
+        unique_edges = []
         for edge in context_edges + reverse_edges:
             if edge.getID() in seen_ids:
                 continue
             seen_ids.add(edge.getID())
+            unique_edges.append(edge)
             direction = "reverse" if edge.getID() in reverse_ids else "forward"
             groups.append(edge_group(edge, direction))
 
+        # Real junction footprints (SUMO's own polygon for the paved
+        # intersection area), one per unique node touched by any edge above.
+        # Not every node is a real intersection, though — netconvert splits
+        # an OSM way into a new edge at *any* shared node, including purely
+        # shape-defining ones used just to trace a gentle curve in an
+        # otherwise "straight" road, and those have no real junction
+        # polygon (getShape() comes back empty). Skipping them left a real
+        # gap at every such point — visually identical to the sharp-turn
+        # tangle this was meant to fix, just triggered by a curve instead
+        # of an intersection. A small synthetic circle at the node's actual
+        # location closes it regardless of why the node exists.
+        junction_nodes = {}
+        for edge in unique_edges:
+            for node in (edge.getFromNode(), edge.getToNode()):
+                junction_nodes[node.getID()] = node
+        junctions = [
+            {"shape": self._junction_patch_shape(node)}
+            for node in junction_nodes.values()
+        ]
+
         msg = String()
-        msg.data = json.dumps({"edges": groups})
+        msg.data = json.dumps({"edges": groups, "junctions": junctions})
         self._lanes_pub.publish(msg)
-        self.get_logger().info(f"Road context published — {len(groups)} edges.")
+        self.get_logger().info(
+            f"Road context published — {len(groups)} edges, {len(junctions)} junctions."
+        )
 
     def _stop_sumo(self) -> None:
         if self._sumo_running and self._traci is not None:

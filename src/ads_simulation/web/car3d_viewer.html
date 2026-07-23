@@ -145,15 +145,18 @@ function offsetPolyline(points, offset) {
   });
 }
 
-// Lane shapes come in junction-free (see sumo_bridge) — real junctions are
-// 2D polygons, and their boundary isn't a clean continuation of a lane's
-// path, so extending into it turned earlier attempts into a tangled,
-// self-overlapping mess once widened into a surface. Instead, extend each
-// lane a fixed distance straight out along its own start/end direction —
-// pure linear extrapolation can never self-intersect, and since the
-// adjacent edge at a junction gets the same treatment, both surfaces
-// overlap enough in the junction area to visually close the gap.
-const LANE_EXTEND_M = 15;
+// Lane shapes come in junction-free (see sumo_bridge) — real junction
+// footprints are drawn separately as their own patch (drawJunctions,
+// below), which is what actually closes the visual gap at intersections
+// now, geometrically correct regardless of how sharply a road turns there.
+// This is just a small safety-margin overlap against any hairline sub-meter
+// gap between an edge's exact endpoint and the junction polygon's boundary
+// — not the primary gap-closing mechanism it used to be (that was a much
+// larger 15m straight-line extrapolation, which only worked where a road
+// kept going roughly straight through the intersection; at an actual turn,
+// two straight extensions going in different directions just crossed each
+// other in a wedge instead of aligning).
+const LANE_EXTEND_M = 2;
 function extendEnds(points, dist) {
   if (points.length < 2) return points;
   const startDir = new THREE.Vector2(
@@ -309,6 +312,33 @@ function drawLanes(edgeGroups) {
   }
 
   scene.add(laneGroup);
+}
+
+// Real junction footprints (SUMO's own polygon for the paved intersection
+// area) rendered as their own flat patch — same technique as the building
+// roof cap below (ShapeGeometry/earcut handles the non-convex shapes real
+// intersections have). Sits just below the lane surface height so lane
+// polygons' small end-extension safely overlaps on top without the two
+// coplanar surfaces z-fighting where they meet.
+const JUNCTION_HEIGHT = 0.4;
+function buildJunctionPatch(footprintPts) {
+  const shape = new THREE.Shape(footprintPts.map((p) => new THREE.Vector2(p.x, -p.z)));
+  const geom = new THREE.ShapeGeometry(shape);
+  geom.rotateX(-Math.PI / 2);
+  geom.translate(0, JUNCTION_HEIGHT, 0);
+  return geom;
+}
+
+let junctionGroup = null;
+function drawJunctions(junctions) {
+  if (junctionGroup) scene.remove(junctionGroup);
+  junctionGroup = new THREE.Group();
+  for (const j of junctions) {
+    const footprintPts = j.shape.map(([x, y]) => toScene(x, y, 0));
+    if (footprintPts.length < 3) continue;
+    junctionGroup.add(new THREE.Mesh(buildJunctionPatch(footprintPts), laneSurfaceMat));
+  }
+  scene.add(junctionGroup);
 }
 
 // ── Buildings ────────────────────────────────────────────────────────────
@@ -486,6 +516,7 @@ function connect() {
       trafficCars.clear();
     } else if (msg.type === "lanes") {
       drawLanes(msg.edges);
+      drawJunctions(msg.junctions || []);
     } else if (msg.type === "buildings") {
       drawBuildings(msg.buildings);
     } else if (msg.type === "ego") {
