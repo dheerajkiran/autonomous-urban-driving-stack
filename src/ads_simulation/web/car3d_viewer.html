@@ -32,6 +32,14 @@
   #connectBar button:hover { background: #4471ff; }
   #status.ok  { color: #6cf28a; }
   #status.bad { color: #ff8a6c; }
+
+  #viewToggleBtn {
+    position: absolute; bottom: 14px; left: 14px;
+    background: rgba(0,0,0,0.55); border: 1px solid #3a4256; color: #d8e6ff;
+    padding: 8px 14px; border-radius: 6px; cursor: pointer;
+    font-family: monospace; font-size: 13px;
+  }
+  #viewToggleBtn:hover { background: rgba(45,95,255,0.35); }
 </style>
 </head>
 <body>
@@ -46,6 +54,8 @@
   <button id="connectBtn">Connect</button>
   <div id="status" class="bad">disconnected</div>
 </div>
+
+<button id="viewToggleBtn">View: Follow (behind car)</button>
 
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
@@ -78,16 +88,22 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.maxPolarAngle = Math.PI * 0.49;   // stop just short of the horizon
 // controls.target is moved to follow the car every frame (see animate()
-// below), and that's the *only* thing driving the camera — OrbitControls'
-// own update() repositions the camera relative to that moving target using
-// whatever angle/distance the user has interactively set via drag/scroll.
-// (An earlier version manually recomputed camera.position from a fixed
-// formula every frame instead, which silently fought and overrode any
-// drag or zoom the user tried — OrbitControls already does exactly this
-// job, so let it.) Pan stays disabled so the view can't drift off the car.
+// below), and that's the *only* thing driving the camera in "free" view
+// mode — OrbitControls' own update() repositions the camera relative to
+// that moving target using whatever angle/distance the user has
+// interactively set via drag/scroll. (An earlier version manually
+// recomputed camera.position from a fixed formula every frame instead,
+// which silently fought and overrode any drag or zoom the user tried —
+// OrbitControls already does exactly this job, so let it.) Pan stays
+// disabled so the view can't drift off the car. Fully disabled (not just
+// enableRotate=false) while in "follow" mode — see animate() — since that
+// mode positions the camera directly and doesn't want OrbitControls
+// fighting it or accumulating stray drag state in the meantime.
 controls.enableRotate = true;
 controls.enablePan = false;
 controls.enableZoom = true;
+controls.minDistance = 12;
+controls.maxDistance = 400;
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.55));
 const sun = new THREE.DirectionalLight(0xffffff, 0.8);
@@ -387,15 +403,31 @@ const TRAFFIC_COLOR = 0xff8a3d, TRAFFIC_EMISSIVE = 0x4a2405;
 const trafficCars = new Map();   // id -> THREE.Group
 
 let egoSeen = false;
-// Camera translates to follow the car's position but does not rotate with
-// its heading — a turning car should visibly change screen-direction, the
-// camera holding a constant angle is what makes that turn readable, rather
-// than the camera swinging to keep the car always "facing away," which
-// looks disorienting mid-turn. Rotate/zoom around that translating point
-// are entirely OrbitControls' own job now (drag/scroll) — only the
-// following itself is manual.
-controls.minDistance = 12;
-controls.maxDistance = 400;
+let egoHeading = 0;   // SUMO convention: 0 = east, CCW positive
+
+// Two view modes, toggled by the button:
+//  - "follow": fixed, close, heading-relative view from just behind the car
+//    (like Waymo's in-rider-app view) — camera position is fully computed
+//    here every frame, OrbitControls disabled entirely so it can't fight it.
+//  - "free": camera translates to follow the car's position but does NOT
+//    rotate with its heading (a turning car visibly changes screen-
+//    direction; the camera holding a constant angle is what makes that
+//    turn readable, rather than swinging to keep the car "facing away,"
+//    which looks disorienting mid-turn) — rotate/zoom around that
+//    translating point are entirely OrbitControls' job (drag/scroll).
+let viewMode = "follow";
+const FOLLOW_DISTANCE_M = 10;                          // behind the car
+const FOLLOW_ELEVATION_RAD = THREE.MathUtils.degToRad(30);   // above horizon ("60 deg from straight up")
+
+const viewToggleBtn = document.getElementById("viewToggleBtn");
+viewToggleBtn.addEventListener("click", () => {
+  viewMode = viewMode === "follow" ? "free" : "follow";
+  controls.enabled = viewMode === "free";
+  viewToggleBtn.textContent = viewMode === "follow"
+    ? "View: Follow (behind car)"
+    : "View: Free (drag to look around)";
+});
+controls.enabled = false;   // starts in "follow" mode
 
 function animate() {
   requestAnimationFrame(animate);
@@ -403,8 +435,21 @@ function animate() {
   // near it) instead of the car, so the view already tracks correctly
   // while previewing a route, before the ego actually exists to follow.
   const followPoint = egoSeen ? car.position : new THREE.Vector3(0, 0, 0);
-  controls.target.lerp(followPoint, 0.2);
-  controls.update();
+
+  if (viewMode === "follow") {
+    const groundDist = FOLLOW_DISTANCE_M * Math.cos(FOLLOW_ELEVATION_RAD);
+    const height = FOLLOW_DISTANCE_M * Math.sin(FOLLOW_ELEVATION_RAD);
+    // Same forward/heading convention validated for the car model itself:
+    // nose direction is (cos(heading), 0, -sin(heading)), so "behind" the
+    // car is the negation of that.
+    const behindX = -Math.cos(egoHeading) * groundDist;
+    const behindZ =  Math.sin(egoHeading) * groundDist;
+    camera.position.set(followPoint.x + behindX, followPoint.y + height, followPoint.z + behindZ);
+    camera.lookAt(followPoint.x, followPoint.y + 1.2, followPoint.z);
+  } else {
+    controls.target.lerp(followPoint, 0.2);
+    controls.update();
+  }
   renderer.render(scene, camera);
 }
 animate();
@@ -454,6 +499,7 @@ function connect() {
       // mirrors the nose direction for any heading off due east/west,
       // which reads as the car spinning the wrong way through a turn.
       car.rotation.y = msg.heading;
+      egoHeading = msg.heading;
       document.getElementById("speed").textContent = (msg.speed * 3.6).toFixed(1) + " km/h";
       document.getElementById("pos").textContent = `x: ${msg.x.toFixed(1)}, y: ${msg.y.toFixed(1)}`;
     } else if (msg.type === "traffic") {
