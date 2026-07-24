@@ -157,6 +157,17 @@ function offsetPolyline(points, offset) {
 // two straight extensions going in different directions just crossed each
 // other in a wedge instead of aligning).
 const LANE_EXTEND_M = 2;
+// Marking lines (dashed dividers, solid outer edges, yellow center line)
+// get their own, longer extension — the filled surface has to stay
+// conservative here because a straight extrapolation is what caused the
+// self-intersecting tangle at turns before real junction patches existed,
+// but that risk doesn't apply to a thin line the same way (a line's
+// occasional minor kink at a sharp corner is far less visible than the
+// hole/pinch it caused on a filled surface). Without this, lines only
+// poked ~2m into a junction that can easily be 15-20m across, leaving a
+// visible gap in the painted lines even though the pavement itself (via
+// the real junction patch) is already fully connected.
+const LINE_EXTEND_M = 10;
 function extendEnds(points, dist) {
   if (points.length < 2) return points;
   const startDir = new THREE.Vector2(
@@ -185,7 +196,7 @@ function extendEnds(points, dist) {
 // the standard "bevel join" technique for offsetting a polyline. This
 // keeps the geometry itself robust even though the extension above is
 // what actually closes the inter-edge gaps.
-function buildLaneSurface(centerPts, width) {
+function buildLaneSurface(centerPts, width, linePts) {
   const half = width / 2;
   const positions = [];
   const segLeftA = [], segRightA = [], segLeftB = [], segRightB = [];
@@ -217,11 +228,10 @@ function buildLaneSurface(centerPts, width) {
   geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geom.computeVertexNormals();
 
-  // Boundary-marking lines keep the simpler per-point offset — a thin
-  // line's occasional minor kink at a sharp corner is far less visible
-  // than the hole/pinch it causes on a filled surface.
-  const left = offsetPolyline(centerPts, half);
-  const right = offsetPolyline(centerPts, -half);
+  // Boundary-marking lines use the separately, more generously extended
+  // linePts (see LINE_EXTEND_M) rather than the surface's own centerPts.
+  const left = offsetPolyline(linePts, half);
+  const right = offsetPolyline(linePts, -half);
   return { geom, left, right };
 }
 
@@ -263,10 +273,11 @@ function drawLanes(edgeGroups) {
   for (const group of edgeGroups) {
     const laneBoundaries = [];
     for (const lane of group.lanes) {
-      let centerPts = lane.shape.map(([x, y]) => toScene(x, y, 0.5));
-      if (centerPts.length < 2) continue;
-      centerPts = extendEnds(centerPts, LANE_EXTEND_M);
-      const { geom, left, right } = buildLaneSurface(centerPts, lane.width);
+      const rawPts = lane.shape.map(([x, y]) => toScene(x, y, 0.5));
+      if (rawPts.length < 2) continue;
+      const centerPts = extendEnds(rawPts, LANE_EXTEND_M);
+      const linePts = extendEnds(rawPts, LINE_EXTEND_M);
+      const { geom, left, right } = buildLaneSurface(centerPts, lane.width, linePts);
       laneGroup.add(new THREE.Mesh(geom, laneSurfaceMat));
       laneBoundaries.push({ left, right });
     }
