@@ -226,6 +226,19 @@ class MapLoader(Node):
                 "--tls.join",
                 "--output.street-names",
                 "--output.original-names",
+                # Geometry-quality flags — purely about how much detail
+                # netconvert generates for junction shapes and lane-count
+                # transitions, doesn't touch edge/node IDs or connectivity,
+                # so routing/spawning logic elsewhere needs no changes for
+                # this. Default junction/internal-link detail is fairly
+                # coarse (blocky corners); higher values ask netconvert to
+                # compute rounder, more realistic shapes instead of us
+                # trying to patch that visually downstream. --osm.lane-access
+                # parses OSM's turn:lanes tagging more precisely when present.
+                "--junctions.corner-detail", "5",
+                "--junctions.internal-link-detail", "8",
+                "--junctions.scurve-stretch", "1.0",
+                "--osm.lane-access",
             ],
             capture_output=True,
             text=True,
