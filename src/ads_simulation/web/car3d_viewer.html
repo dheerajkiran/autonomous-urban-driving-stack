@@ -102,7 +102,13 @@ controls.maxPolarAngle = Math.PI * 0.49;   // stop just short of the horizon
 controls.enableRotate = true;
 controls.enablePan = false;
 controls.enableZoom = true;
-controls.minDistance = 12;
+// 30, not the previous 12 — the satellite ground texture covers a real
+// street-scale area at real photo resolution (roughly 0.3m/px), and no
+// satellite imagery (ours or anyone's) stays sharp much closer than this;
+// bounding how close the camera can get avoids ever exposing that blur,
+// which is more effective than chasing a higher-resolution fetch, since
+// that only buys a little before hitting the same wall.
+controls.minDistance = 30;
 controls.maxDistance = 400;
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.55));
@@ -119,7 +125,12 @@ scene.add(ground);
 
 const grid = new THREE.GridHelper(4000, 80, 0x2a3142, 0x22293a);
 grid.position.y = 0.3;   // clear of the ground plane, still below the route line
-scene.add(grid);
+// Not added to the scene — its bright center line (crossing through
+// world origin, near the route start) reads as a stray line cutting
+// across the satellite photo. It was fine as a stylistic aid on the old
+// plain dark ground; redundant and distracting now that the photo itself
+// provides visual context/scale.
+// scene.add(grid);
 
 // SUMO (x, y) meters -> Three.js (x, 0, -y) so "up" in SUMO's top-down
 // view maps to "further away" on screen instead of flipping the scene.
@@ -416,6 +427,56 @@ function drawBuildings(buildings) {
   scene.add(buildingGroup);
 }
 
+// ── Satellite ground truth ──────────────────────────────────────────────
+// Real photo instead of procedurally-generated road geometry — see the
+// "lanes"/"buildings" handlers above for why. bbox_xy gives the two
+// corners of the fetched area in our recentered scene coordinates; the
+// plane is sized/positioned to match exactly, so the photo lines up with
+// wherever the ego/traffic actually are.
+let satelliteMesh = null;
+function drawSatellite(bboxXY, imageB64) {
+  if (satelliteMesh) {
+    scene.remove(satelliteMesh);
+    satelliteMesh.geometry.dispose();
+    satelliteMesh.material.dispose();
+  }
+  // Raw quad with explicit vertex positions and UVs, computed directly
+  // from the known geographic corners — not PlaneGeometry's default UV
+  // generation plus a rotation plus texture.flipY, three separate implicit
+  // conventions stacked together that are easy to get backwards without
+  // noticing (which is exactly what caused the image to be misaligned).
+  // bbox_xy[0] is the (west, south) corner, bbox_xy[1] is (east, north).
+  const [[x0, y0], [x1, y1]] = bboxXY;
+  const GROUND_Y = 0.05;   // above the dark background plane, below the car/buildings
+  const sw = toScene(x0, y0, GROUND_Y);
+  const se = toScene(x1, y0, GROUND_Y);
+  const nw = toScene(x0, y1, GROUND_Y);
+  const ne = toScene(x1, y1, GROUND_Y);
+
+  const positions = new Float32Array([
+    sw.x, sw.y, sw.z,  se.x, se.y, se.z,  nw.x, nw.y, nw.z,
+    se.x, se.y, se.z,  ne.x, ne.y, ne.z,  nw.x, nw.y, nw.z,
+  ]);
+  // texture.flipY = false below means V=0 samples the image's first (top)
+  // row directly — a standard north-up export has north at the top, so
+  // V=0 -> north, V=1 -> south. U=0 -> west (left), U=1 -> east (right).
+  const uvs = new Float32Array([
+    0, 1,  1, 1,  0, 0,
+    1, 1,  1, 0,  0, 0,
+  ]);
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geom.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geom.computeVertexNormals();
+
+  const texture = new THREE.TextureLoader().load(`data:image/jpeg;base64,${imageB64}`);
+  texture.flipY = false;
+  const mat = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide });
+  satelliteMesh = new THREE.Mesh(geom, mat);
+  scene.add(satelliteMesh);
+}
+
 // Simple car proxy: body + cabin, nose along +X (rotated to match heading).
 function makeCar(bodyColor, emissiveColor) {
   const group = new THREE.Group();
@@ -457,7 +518,10 @@ let egoHeading = 0;   // SUMO convention: 0 = east, CCW positive
 //    which looks disorienting mid-turn) — rotate/zoom around that
 //    translating point are entirely OrbitControls' job (drag/scroll).
 let viewMode = "follow";
-const FOLLOW_DISTANCE_M = 10;                          // behind the car
+// 30, not the original 10 — same reasoning as controls.minDistance above:
+// the satellite ground texture blurs up close, so the fixed follow view
+// needs to stay far enough back to not sit inside that blur range either.
+const FOLLOW_DISTANCE_M = 30;                          // behind the car
 const FOLLOW_ELEVATION_RAD = THREE.MathUtils.degToRad(30);   // above horizon ("60 deg from straight up")
 
 const viewToggleBtn = document.getElementById("viewToggleBtn");
@@ -526,10 +590,26 @@ function connect() {
       for (const mesh of trafficCars.values()) scene.remove(mesh);
       trafficCars.clear();
     } else if (msg.type === "lanes") {
-      drawLanes(msg.edges);
-      drawJunctions(msg.junctions || []);
+      // Procedural road/junction rendering disabled in favor of the real
+      // satellite photo (see "satellite" below) — OSM's data doesn't carry
+      // lane-level precision, so no matter how much special-casing this
+      // got, it kept producing wrong geometry at some sharp bend or
+      // lane-count transition somewhere. A real photo has no junction
+      // shape or lane count to get wrong, because nothing is generated.
+      // sumo_bridge still computes and sends this; left disabled here
+      // (not removed server-side) in case it's worth a toggle later.
+      // drawLanes(msg.edges);
+      // drawJunctions(msg.junctions || []);
     } else if (msg.type === "buildings") {
+      // Re-enabled: a straight-down satellite photo can only ever show a
+      // building's flat rooftop outline, never its actual height/walls —
+      // that's information a top-down photo just doesn't contain. The
+      // photo is a good flat *road* surface (roads are genuinely flat),
+      // but buildings need real procedural volume on top of it, or the
+      // scene reads as entirely flat/2D.
       drawBuildings(msg.buildings);
+    } else if (msg.type === "satellite") {
+      drawSatellite(msg.bbox_xy, msg.image_b64);
     } else if (msg.type === "ego") {
       car.visible = true;
       egoSeen = true;

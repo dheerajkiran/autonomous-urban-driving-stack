@@ -56,6 +56,16 @@ Publishes
                                                     afford hundreds of rendered cars regardless of
                                                     how many actually exist in the simulation.
                                                     Raw SUMO x/y, for car3d_bridge only.
+/navigation/route_satellite  (std_msgs/String)  — JSON real satellite photo covering the
+                                                    route's area, for car3d_viewer's ground plane:
+                                                    {"bbox_xy": [[x0,y0],[x1,y1]], "image_b64": "..."}.
+                                                    Fetched from ESRI World Imagery (no API key
+                                                    needed), same bbox/background-thread pattern
+                                                    as route_buildings. This is the ground truth
+                                                    the 3D viewer now uses instead of procedurally
+                                                    generated road/junction geometry, which kept
+                                                    hitting real edge cases OSM's data doesn't have
+                                                    the precision to resolve.
 """
 
 import json
@@ -110,6 +120,7 @@ class SumoBridge(Node):
         self._lanes_pub  = self.create_publisher(String, "/navigation/route_lanes", 10)
         self._buildings_pub = self.create_publisher(String, "/navigation/route_buildings", 10)
         self._traffic_pub   = self.create_publisher(String, "/navigation/traffic_vehicles", 10)
+        self._satellite_pub = self.create_publisher(String, "/navigation/route_satellite", 10)
 
         self._map_status_sub = self.create_subscription(
             String, "/map/status", self._on_map_status, 10
@@ -409,6 +420,7 @@ class SumoBridge(Node):
         self._publish_route_lanes(edges)
         if spawn:
             self._publish_route_buildings(waypoints)
+            self._publish_route_satellite(waypoints)
 
     def _publish_route_buildings(self, waypoints: list) -> None:
         """Kick off a background fetch of building footprints near the route.
@@ -484,6 +496,83 @@ class SumoBridge(Node):
         msg.data = json.dumps({"buildings": buildings})
         self._buildings_pub.publish(msg)
         self.get_logger().info(f"Fetched {len(buildings)} building footprints near route.")
+
+    def _publish_route_satellite(self, waypoints: list) -> None:
+        """Kick off a background fetch of a real satellite photo covering
+        the route's area, for car3d_viewer to use as ground truth instead
+        of our own procedurally-generated road surface.
+
+        The procedural approach (lane shapes + synthetic junction patches +
+        via-lane connectors) kept hitting real edge cases — self-intersecting
+        surfaces at sharp bends, lane-count transitions rendering as abrupt
+        steps, junction patches sized wrong — because OSM's road data simply
+        doesn't carry lane-level precision, no matter how much special-casing
+        we added on top of it. A real photo has none of that: it's
+        unconditionally accurate because nothing is generated, there's no
+        junction shape or lane count to get wrong.
+
+        Same bbox/background-thread reasoning as the building fetch: routes
+        are picked interactively, so we fetch only the current route's area
+        rather than the whole city, and never block ego spawning on the
+        network round-trip.
+        """
+        lats = [wp.latitude for wp in waypoints]
+        lons = [wp.longitude for wp in waypoints]
+        pad = self._building_pad_deg
+        south, north = min(lats) - pad, max(lats) + pad
+        west, east = min(lons) - pad, max(lons) + pad
+
+        # Corner coordinates in SUMO's local metric frame, computed here
+        # (fast, local, no network dependency) rather than in the
+        # background thread, so the thread only ever does the slow part.
+        x0, y0 = self._net.convertLonLat2XY(west, south)
+        x1, y1 = self._net.convertLonLat2XY(east, north)
+        bbox_xy = [[x0, y0], [x1, y1]]
+
+        threading.Thread(
+            target=self._fetch_and_publish_satellite,
+            args=(south, west, north, east, bbox_xy),
+            daemon=True,
+        ).start()
+
+    def _fetch_and_publish_satellite(
+        self, south: float, west: float, north: float, east: float, bbox_xy: list
+    ) -> None:
+        # Preserve the bbox's real-world aspect ratio so the image doesn't
+        # stretch — longitude degrees are foreshortened by cos(latitude).
+        mid_lat_rad = math.radians((south + north) / 2.0)
+        x_extent_m = max((east - west) * 111320.0 * math.cos(mid_lat_rad), 1.0)
+        y_extent_m = max((north - south) * 110540.0, 1.0)
+        height = 1024
+        width = max(256, min(2048, round(height * x_extent_m / y_extent_m)))
+
+        # ESRI World Imagery — no API key required, unlike Mapbox/Google.
+        url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export"
+        params = {
+            "bbox": f"{west},{south},{east},{north}",
+            "bboxSR": "4326",
+            "imageSR": "4326",
+            "size": f"{width},{height}",
+            "format": "jpg",
+            "f": "image",
+        }
+        try:
+            import requests
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+        except Exception as exc:
+            self.get_logger().warn(f"Satellite fetch failed (non-fatal): {exc}")
+            return
+
+        import base64
+        image_b64 = base64.b64encode(response.content).decode("ascii")
+
+        msg = String()
+        msg.data = json.dumps({"bbox_xy": bbox_xy, "image_b64": image_b64})
+        self._satellite_pub.publish(msg)
+        self.get_logger().info(
+            f"Satellite image fetched — {width}x{height}, {len(response.content)} bytes."
+        )
 
     def _reverse_edges(self, edges: list) -> list:
         """Look up each edge's paired opposite-direction edge, in order.

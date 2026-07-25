@@ -19,6 +19,7 @@ Subscribes
 /navigation/route_lanes      (std_msgs/String)  — JSON per-lane geometry for the same route
 /navigation/route_buildings  (std_msgs/String)  — JSON building footprints near the same route
 /navigation/traffic_vehicles (std_msgs/String)  — JSON background traffic state, every sim tick
+/navigation/route_satellite  (std_msgs/String)  — JSON real satellite photo covering the route
 /vehicle/state                (ads_interfaces/msg/VehicleState)
 
 Serves
@@ -31,6 +32,7 @@ ws://0.0.0.0:<ws_port>  — JSON messages, each also sent to a client on connect
   {"type": "buildings", "buildings": [[[x,y], ...], ...]}
   {"type": "ego", "x":, "y":, "heading":, "speed":}   — sent on every /vehicle/state update
   {"type": "traffic", "vehicles": [{"id":, "x":, "y":, "heading":, "speed":}, ...]}
+  {"type": "satellite", "bbox_xy": [[x0,y0],[x1,y1]], "image_b64": "..."}
 """
 
 import asyncio
@@ -58,6 +60,7 @@ class Car3DBridge(Node):
         self._lanes_json: Optional[str] = None
         self._buildings_json: Optional[str] = None
         self._traffic_json: Optional[str] = None
+        self._satellite_json: Optional[str] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Recenter on the route's own start point rather than any city-wide
         # reference — keeps scene coordinates small regardless of where in
@@ -69,6 +72,7 @@ class Car3DBridge(Node):
         self.create_subscription(String, "/navigation/route_lanes", self._on_route_lanes, 10)
         self.create_subscription(String, "/navigation/route_buildings", self._on_route_buildings, 10)
         self.create_subscription(String, "/navigation/traffic_vehicles", self._on_traffic_vehicles, 10)
+        self.create_subscription(String, "/navigation/route_satellite", self._on_route_satellite, 10)
 
         threading.Thread(target=self._run_ws_server, daemon=True).start()
 
@@ -131,6 +135,22 @@ class Car3DBridge(Node):
 
         if self._loop is not None:
             asyncio.run_coroutine_threadsafe(self._broadcast(self._buildings_json), self._loop)
+
+    def _on_route_satellite(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        ox, oy = self._origin
+        (x0, y0), (x1, y1) = data["bbox_xy"]
+        self._satellite_json = json.dumps({
+            "type": "satellite",
+            "bbox_xy": [[x0 - ox, y0 - oy], [x1 - ox, y1 - oy]],
+            "image_b64": data["image_b64"],
+        })
+
+        if self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._broadcast(self._satellite_json), self._loop)
 
     def _on_traffic_vehicles(self, msg: String) -> None:
         try:
@@ -198,6 +218,8 @@ class Car3DBridge(Node):
                     await websocket.send(self._buildings_json)
                 if self._traffic_json:
                     await websocket.send(self._traffic_json)
+                if self._satellite_json:
+                    await websocket.send(self._satellite_json)
                 async for _ in websocket:
                     pass   # no client -> server messages expected
             finally:
