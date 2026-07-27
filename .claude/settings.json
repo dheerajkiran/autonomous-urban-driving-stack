@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p \"/Users/dheerajkiran/Autonomous Project/src/ads_interfaces/msg\")",
+      "Bash(mkdir -p \"/Users/dheerajkiran/Autonomous Project/src/ads_vehicle_state/ads_vehicle_state\")",
+      "Bash(mkdir -p \"/Users/dheerajkiran/Autonomous Project/src/ads_vehicle_state/config\")",
+      "Bash(mkdir -p \"/Users/dheerajkiran/Autonomous Project/src/ads_vehicle_state/launch\")",
+      "Bash(mkdir -p \"/Users/dheerajkiran/Autonomous Project/src/ads_vehicle_state/resource\")",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(curl -s https://api.github.com/repos/dheerajkiran/autonomous-urban-driving-stack)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('Description:', d.get\\('description'\\)\\); print\\('Topics:', d.get\\('topics'\\)\\); print\\('Homepage:', d.get\\('homepage'\\)\\)\")",
+      "Bash(git remote *)",
+      "Bash(git filter-branch -f --env-filter ' *)",
+      "Bash(git push *)",
+      "Bash(git config *)",
+      "Bash(gh repo *)",
+      "Bash(python3 -m py_compile src/ads_simulation/launch/simulation.launch.py src/ads_map/launch/map.launch.py)",
+      "Bash(python3 -m py_compile launch/ads_full.launch.py)",
+      "Bash(python3 -m py_compile src/ads_map/ads_map/map_loader.py)",
+      "Bash(python3 -m py_compile src/ads_simulation/ads_simulation/pygame_viewer.py)",
+      "Bash(git commit -m ' *)",
+      "Bash(curl -s \"https://api.github.com/repos/dheerajkiran/autonomous-urban-driving-stack\")",
+      "Bash(python3 -c ' *)",
+      "Bash(grep -E \"^\\(build|install|log\\)/|__pycache__|\\\\.pyc$\")",
+      "Bash(git credential *)",
+      "Bash(python3 -m py_compile src/ads_map/ads_map/route_planner.py)",
+      "Bash(git tag *)",
+      "Bash(curl -s \"https://api.github.com/repos/dheerajkiran/autonomous-urban-driving-stack/tags\")",
+      "Bash(python3 -m py_compile src/ads_simulation/ads_simulation/car3d_bridge.py)",
+      "Bash(rsync -avz --exclude \"__pycache__/\" --exclude \"*.pyc\" src/ src2_check_dryrun)",
+      "Bash(node -e \"require\\('fs'\\).readFileSync\\('src/ads_simulation/web/car3d_viewer.html','utf8'\\)\")",
+      "Bash(node --check /tmp/car3d_viewer_check.js)",
+      "Bash(python3 -m py_compile src/ads_simulation/ads_simulation/sumo_bridge.py src/ads_simulation/ads_simulation/car3d_bridge.py)"
+    ]
+  }
+}

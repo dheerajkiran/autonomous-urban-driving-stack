@@ -43,3 +43,6 @@ CarlaUE4/
 # Coverage
 .coverage
 htmlcov/
+
+# Claude Code local-only settings
+.claude/settings.local.json
