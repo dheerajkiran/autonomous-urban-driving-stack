@@ -352,6 +352,60 @@ function drawJunctions(junctions) {
   scene.add(junctionGroup);
 }
 
+// ── Sidewalks ────────────────────────────────────────────────────────────
+// Ribbon polygons already buffered to width server-side (sumo_bridge), so
+// this is just a flat patch per shape — same ShapeGeometry/earcut technique
+// as the junction patch. Real sidewalks sit above the road surface (curb
+// height), not below it, so this is the lane surface height (0.5) plus a
+// ~15cm curb rise, rather than just clearing the ground plane.
+const SIDEWALK_HEIGHT = 0.65;
+const sidewalkMat = new THREE.MeshStandardMaterial({ color: 0x9c9284, side: THREE.DoubleSide });
+
+function buildSidewalkPatch(shapePts) {
+  const shape = new THREE.Shape(shapePts.map((p) => new THREE.Vector2(p.x, -p.z)));
+  const geom = new THREE.ShapeGeometry(shape);
+  geom.rotateX(-Math.PI / 2);
+  geom.translate(0, SIDEWALK_HEIGHT, 0);
+  return geom;
+}
+
+// Short curb face around the ribbon's perimeter (road surface height up to
+// the sidewalk top) — without this the raised patch above would look like
+// a floating slab from any angle that isn't strictly top-down, since it's
+// otherwise just a flat cap with nothing connecting it down to road level.
+// Same technique as buildBuildingWalls below.
+function buildSidewalkWalls(shapePts) {
+  const positions = [];
+  const n = shapePts.length;
+  for (let i = 0; i < n; i++) {
+    const a = shapePts[i];
+    const b = shapePts[(i + 1) % n];
+    const a0 = new THREE.Vector3(a.x, 0.5, a.z);
+    const a1 = new THREE.Vector3(a.x, SIDEWALK_HEIGHT, a.z);
+    const b0 = new THREE.Vector3(b.x, 0.5, b.z);
+    const b1 = new THREE.Vector3(b.x, SIDEWALK_HEIGHT, b.z);
+    positions.push(a0.x, a0.y, a0.z, b0.x, b0.y, b0.z, a1.x, a1.y, a1.z);
+    positions.push(b0.x, b0.y, b0.z, b1.x, b1.y, b1.z, a1.x, a1.y, a1.z);
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geom.computeVertexNormals();
+  return geom;
+}
+
+let sidewalkGroup = null;
+function drawSidewalks(sidewalks) {
+  if (sidewalkGroup) scene.remove(sidewalkGroup);
+  sidewalkGroup = new THREE.Group();
+  for (const shape of sidewalks) {
+    const shapePts = shape.map(([x, y]) => toScene(x, y, 0));
+    if (shapePts.length < 3) continue;
+    sidewalkGroup.add(new THREE.Mesh(buildSidewalkPatch(shapePts), sidewalkMat));
+    sidewalkGroup.add(new THREE.Mesh(buildSidewalkWalls(shapePts), sidewalkMat));
+  }
+  scene.add(sidewalkGroup);
+}
+
 // ── Buildings ────────────────────────────────────────────────────────────
 // Note: the camera is a strict top-down view (see CHASE_OFFSET below), so
 // walls won't read as visible 3D volume from directly overhead — mostly
@@ -528,6 +582,8 @@ function connect() {
     } else if (msg.type === "lanes") {
       drawLanes(msg.edges);
       drawJunctions(msg.junctions || []);
+    } else if (msg.type === "sidewalks") {
+      drawSidewalks(msg.sidewalks);
     } else if (msg.type === "buildings") {
       drawBuildings(msg.buildings);
     } else if (msg.type === "ego") {

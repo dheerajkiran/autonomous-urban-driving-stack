@@ -43,6 +43,16 @@ Publishes
                                                    route needs. Runs in a background thread so the
                                                    network round-trip never blocks ego spawning.
                                                    Raw SUMO x/y, for car3d_bridge only.
+/navigation/route_sidewalks (std_msgs/String)  — JSON sidewalk ribbon polygons near the current
+                                                   route: {"sidewalks": [[[x,y], ...], ...]}.
+                                                   Same live-Overpass-fetch, same padded bbox, same
+                                                   background thread as route_buildings — OSM's
+                                                   footway ways are centerlines, buffered here into
+                                                   a fixed-width ribbon polygon so car3d_viewer can
+                                                   render them as flat paved strips like it does
+                                                   junction patches. Visual only — no SUMO pedestrian
+                                                   infrastructure or agents involved. Raw SUMO x/y,
+                                                   for car3d_bridge only.
 /navigation/traffic_vehicles (std_msgs/String)  — JSON state for ambient traffic, published
                                                     every tick: {"vehicles": [{"id":, "x":, "y":,
                                                     "heading":, "speed":}, ...]}. Hundreds of
@@ -72,6 +82,33 @@ from std_msgs.msg import String
 from ads_interfaces.msg import Route, VehicleState, Waypoint
 
 
+def _buffer_polyline(points: list, half_width: float) -> Optional[list]:
+    """Turn a centerline (OSM footway nodes) into a flat ribbon polygon.
+
+    Offsets each vertex perpendicular to its local tangent by half_width on
+    both sides, then closes the loop (left side forward + right side
+    reversed). Approximate at sharp bends — fine for OSM sidewalks, which
+    are near-straight runs alongside a road, not something that needs a
+    proper miter-join buffer algorithm.
+    """
+    n = len(points)
+    if n < 2:
+        return None
+    left, right = [], []
+    for i in range(n):
+        if i == 0:
+            dx, dy = points[1][0] - points[0][0], points[1][1] - points[0][1]
+        elif i == n - 1:
+            dx, dy = points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]
+        else:
+            dx, dy = points[i + 1][0] - points[i - 1][0], points[i + 1][1] - points[i - 1][1]
+        length = math.hypot(dx, dy)
+        nx, ny = (-dy / length, dx / length) if length > 1e-6 else (0.0, 0.0)
+        left.append([points[i][0] + nx * half_width, points[i][1] + ny * half_width])
+        right.append([points[i][0] - nx * half_width, points[i][1] - ny * half_width])
+    return left + right[::-1]
+
+
 class SumoBridge(Node):
 
     def __init__(self) -> None:
@@ -85,6 +122,7 @@ class SumoBridge(Node):
         self.declare_parameter("use_gui", False)
         self.declare_parameter("edge_search_radius_m", 50.0)
         self.declare_parameter("building_search_pad_deg", 0.0006)   # ~60m
+        self.declare_parameter("sidewalk_width_m", 1.5)
         self.declare_parameter("road_context_pad_m", 450.0)
         self.declare_parameter("ambient_traffic_count", 300)
         self.declare_parameter("ambient_spawn_batch", 10)
@@ -97,6 +135,7 @@ class SumoBridge(Node):
         self._use_gui      = self.get_parameter("use_gui").value
         self._edge_search_radius_m = self.get_parameter("edge_search_radius_m").value
         self._building_pad_deg = self.get_parameter("building_search_pad_deg").value
+        self._sidewalk_width_m = self.get_parameter("sidewalk_width_m").value
         self._road_context_pad_m = self.get_parameter("road_context_pad_m").value
         self._ambient_traffic_count = self.get_parameter("ambient_traffic_count").value
         self._ambient_spawn_batch = self.get_parameter("ambient_spawn_batch").value
@@ -109,6 +148,7 @@ class SumoBridge(Node):
         self._route_pub  = self.create_publisher(Route, "/navigation/route", 10)
         self._lanes_pub  = self.create_publisher(String, "/navigation/route_lanes", 10)
         self._buildings_pub = self.create_publisher(String, "/navigation/route_buildings", 10)
+        self._sidewalks_pub = self.create_publisher(String, "/navigation/route_sidewalks", 10)
         self._traffic_pub   = self.create_publisher(String, "/navigation/traffic_vehicles", 10)
 
         self._map_status_sub = self.create_subscription(
@@ -409,6 +449,7 @@ class SumoBridge(Node):
         self._publish_route_lanes(edges)
         if spawn:
             self._publish_route_buildings(waypoints)
+            self._publish_route_sidewalks(waypoints)
 
     def _publish_route_buildings(self, waypoints: list) -> None:
         """Kick off a background fetch of building footprints near the route.
@@ -484,6 +525,89 @@ class SumoBridge(Node):
         msg.data = json.dumps({"buildings": buildings})
         self._buildings_pub.publish(msg)
         self.get_logger().info(f"Fetched {len(buildings)} building footprints near route.")
+
+    def _publish_route_sidewalks(self, waypoints: list) -> None:
+        """Kick off a background fetch of sidewalk footpaths near the route.
+
+        Same rationale and same padded-bbox/background-thread pattern as
+        _publish_route_buildings — routes are picked interactively, so there's
+        no way to know ahead of time which sidewalks to show.
+        """
+        lats = [wp.latitude for wp in waypoints]
+        lons = [wp.longitude for wp in waypoints]
+        pad = self._building_pad_deg
+        bbox = (min(lats) - pad, min(lons) - pad, max(lats) + pad, max(lons) + pad)
+        threading.Thread(
+            target=self._fetch_and_publish_sidewalks, args=(bbox,), daemon=True
+        ).start()
+
+    def _fetch_and_publish_sidewalks(self, bbox: tuple) -> None:
+        south, west, north, east = bbox
+        query = (
+            "[out:xml][timeout:60];"
+            f'way["highway"="footway"]["footway"!="crossing"]({south},{west},{north},{east});'
+            "(._;>;);"
+            "out body;"
+        )
+        import requests
+        response = None
+        # One retry: Overpass is a shared, unauthenticated public API that
+        # occasionally 504s under load — a single retry clears most of those
+        # without adding much latency, since the fetch already runs off the
+        # main thread and doesn't block ego spawning.
+        for attempt in range(2):
+            try:
+                response = requests.post(
+                    "https://overpass-api.de/api/interpreter",
+                    data={"data": query},
+                    headers={"User-Agent": "autonomous-driving-stack/0.1 (portfolio project)"},
+                    timeout=60,
+                )
+                response.raise_for_status()
+                break
+            except Exception as exc:
+                if attempt == 1:
+                    self.get_logger().warn(f"Sidewalk fetch failed (non-fatal): {exc}")
+                    return
+                self.get_logger().warn(f"Sidewalk fetch failed, retrying once: {exc}")
+
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(response.content)
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to parse sidewalk response: {exc}")
+            return
+
+        nodes = {}
+        for node in root.findall("node"):
+            try:
+                nodes[node.get("id")] = (float(node.get("lat")), float(node.get("lon")))
+            except (TypeError, ValueError):
+                continue
+
+        half_width = self._sidewalk_width_m / 2.0
+        sidewalks = []
+        for way in root.findall("way"):
+            if not any(
+                tag.get("k") == "highway" and tag.get("v") == "footway"
+                for tag in way.findall("tag")
+            ):
+                continue
+            centerline = []
+            for nd in way.findall("nd"):
+                latlon = nodes.get(nd.get("ref"))
+                if latlon is None:
+                    continue
+                x, y = self._net.convertLonLat2XY(latlon[1], latlon[0])
+                centerline.append((x, y))
+            ribbon = _buffer_polyline(centerline, half_width)
+            if ribbon is not None:
+                sidewalks.append(ribbon)
+
+        msg = String()
+        msg.data = json.dumps({"sidewalks": sidewalks})
+        self._sidewalks_pub.publish(msg)
+        self.get_logger().info(f"Fetched {len(sidewalks)} sidewalk segments near route.")
 
     def _reverse_edges(self, edges: list) -> list:
         """Look up each edge's paired opposite-direction edge, in order.
