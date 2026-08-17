@@ -40,6 +40,19 @@
     font-family: monospace; font-size: 13px;
   }
   #viewToggleBtn:hover { background: rgba(45,95,255,0.35); }
+
+  #trafficControl {
+    position: absolute; bottom: 14px; right: 14px;
+    background: rgba(0,0,0,0.55); border: 1px solid #3a4256; color: #d8e6ff;
+    padding: 8px 14px; border-radius: 6px; font-family: monospace; font-size: 13px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  #trafficControl button {
+    background: rgba(45,95,255,0.25); border: 1px solid #3a4256; color: #d8e6ff;
+    width: 26px; height: 26px; border-radius: 4px; cursor: pointer;
+    font-family: monospace; font-size: 13px; line-height: 1;
+  }
+  #trafficControl button:hover { background: rgba(45,95,255,0.45); }
 </style>
 </head>
 <body>
@@ -56,6 +69,12 @@
 </div>
 
 <button id="viewToggleBtn">View: Follow (behind car)</button>
+
+<div id="trafficControl">
+  Local Traffic: <span id="trafficCount">--</span>
+  <button id="trafficDownBtn" title="Decrease traffic">&#9660;</button>
+  <button id="trafficUpBtn" title="Increase traffic">&#9650;</button>
+</div>
 
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
@@ -527,6 +546,23 @@ viewToggleBtn.addEventListener("click", () => {
 });
 controls.enabled = false;   // starts in "follow" mode
 
+// Local traffic density control — scoped to a pool of vehicles sumo_bridge
+// spawns/removes near the ego's current position specifically (separate
+// from the always-on city-wide ambient traffic), so this is meant for
+// dialing up density right around the car to watch how it reacts. The
+// up/down buttons just send a delta; the displayed count only updates once
+// the server echoes back the real target via a "traffic_target" message
+// (handled below), not optimistically on click, since sumo_bridge
+// clamps/owns the actual value.
+const TRAFFIC_STEP = 10;
+function sendTrafficAdjust(delta) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "traffic_adjust", delta }));
+  }
+}
+document.getElementById("trafficUpBtn").addEventListener("click", () => sendTrafficAdjust(TRAFFIC_STEP));
+document.getElementById("trafficDownBtn").addEventListener("click", () => sendTrafficAdjust(-TRAFFIC_STEP));
+
 function animate() {
   requestAnimationFrame(animate);
   // Before the ego spawns, follow the scene origin (routes are recentered
@@ -624,6 +660,8 @@ function connect() {
           trafficCars.delete(id);
         }
       }
+    } else if (msg.type === "traffic_target") {
+      document.getElementById("trafficCount").textContent = msg.count;
     }
   };
 }

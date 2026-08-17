@@ -66,6 +66,29 @@ Publishes
                                                     afford hundreds of rendered cars regardless of
                                                     how many actually exist in the simulation.
                                                     Raw SUMO x/y, for car3d_bridge only.
+/navigation/traffic_target (std_msgs/Int32)  — current *local* traffic target count (the pool
+                                                 near the ego that the viewer's traffic buttons
+                                                 control — separate from the always-on city-wide
+                                                 ambient_traffic_count above, which this doesn't
+                                                 touch). Published once SUMO starts (0) and again
+                                                 on every /navigation/traffic_adjust, so
+                                                 car3d_viewer's traffic control always shows the
+                                                 real number rather than assuming its own
+                                                 optimistic delta landed.
+
+Also subscribes
+----------------
+/navigation/traffic_adjust (std_msgs/Int32)  — relayed from car3d_viewer's traffic up/down
+                                                 buttons. Positive raises the local-traffic
+                                                 target for _replenish_local_traffic to spawn
+                                                 toward, on edges near the ego's *current*
+                                                 position (recomputed each tick as the ego
+                                                 moves) rather than random city-wide edges;
+                                                 negative removes the nearest local_ vehicles to
+                                                 the ego immediately (traci.vehicle.remove)
+                                                 rather than waiting on them to finish their own
+                                                 trip, which could take far longer than a user
+                                                 watching the button click do nothing.
 """
 
 import json
@@ -77,9 +100,12 @@ from typing import Optional
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Int32, String
 
 from ads_interfaces.msg import Route, VehicleState, Waypoint
+
+LOCAL_TRAFFIC_MAX = 150   # upper bound for the viewer's traffic-up button — local
+                           # area is a few hundred meters across, not the whole city
 
 
 def _buffer_polyline(points: list, half_width: float) -> Optional[list]:
@@ -126,6 +152,8 @@ class SumoBridge(Node):
         self.declare_parameter("road_context_pad_m", 450.0)
         self.declare_parameter("ambient_traffic_count", 300)
         self.declare_parameter("ambient_spawn_batch", 10)
+        self.declare_parameter("local_traffic_pad_m", 300.0)
+        self.declare_parameter("local_traffic_spawn_batch", 5)
 
         self._cache_dir    = Path(self.get_parameter("cache_dir").value).expanduser()
         self._net_filename = self.get_parameter("net_filename").value
@@ -139,6 +167,8 @@ class SumoBridge(Node):
         self._road_context_pad_m = self.get_parameter("road_context_pad_m").value
         self._ambient_traffic_count = self.get_parameter("ambient_traffic_count").value
         self._ambient_spawn_batch = self.get_parameter("ambient_spawn_batch").value
+        self._local_traffic_pad_m = self.get_parameter("local_traffic_pad_m").value
+        self._local_traffic_spawn_batch = self.get_parameter("local_traffic_spawn_batch").value
 
         self._net_path = self._cache_dir / self._net_filename
         self._cfg_path = self._cache_dir / self._cfg_filename
@@ -150,6 +180,7 @@ class SumoBridge(Node):
         self._buildings_pub = self.create_publisher(String, "/navigation/route_buildings", 10)
         self._sidewalks_pub = self.create_publisher(String, "/navigation/route_sidewalks", 10)
         self._traffic_pub   = self.create_publisher(String, "/navigation/traffic_vehicles", 10)
+        self._traffic_target_pub = self.create_publisher(Int32, "/navigation/traffic_target", 10)
 
         self._map_status_sub = self.create_subscription(
             String, "/map/status", self._on_map_status, 10
@@ -160,6 +191,9 @@ class SumoBridge(Node):
         self._mission_confirm_sub = self.create_subscription(
             String, "/navigation/mission_confirm", self._on_mission_confirm, 10
         )
+        self._traffic_adjust_sub = self.create_subscription(
+            Int32, "/navigation/traffic_adjust", self._on_traffic_adjust, 10
+        )
 
         self._sumo_running: bool      = False
         self._traci: Optional[object] = None
@@ -168,6 +202,8 @@ class SumoBridge(Node):
         self._pending_goal: Optional[dict] = None
         self._route_counter = 0
         self._ambient_counter = 0
+        self._local_traffic_counter = 0
+        self._local_traffic_target = 0   # controlled by the viewer's traffic up/down buttons
 
         self._timer = self.create_timer(1.0 / self._publish_rate, self._tick)
         # Separate, slower timer — ambient traffic is city-wide and
@@ -175,6 +211,10 @@ class SumoBridge(Node):
         # the main 50Hz simulation tick's cadence, and routing a batch of
         # new vehicles is too much work to redo that often anyway.
         self._ambient_timer = self.create_timer(2.0, self._replenish_ambient_traffic)
+        # Same cadence, separate pool — this one is scoped to near the ego's
+        # current (moving) position rather than the whole city, and is the
+        # one the viewer's traffic buttons actually control.
+        self._local_traffic_timer = self.create_timer(2.0, self._replenish_local_traffic)
 
         self.get_logger().info(
             f"SumoBridge initialized — net='{self._net_path}', "
@@ -270,6 +310,7 @@ class SumoBridge(Node):
             traci.start(sumo_cmd)
             self._sumo_running = True
             self._publish_status("RUNNING")
+            self._publish_traffic_target()
             self.get_logger().info(
                 f"SUMO started — cfg={'yes' if use_cfg else 'no'}, gui={self._use_gui}"
             )
@@ -638,6 +679,107 @@ class SumoBridge(Node):
             seen_ids.add(reverse_edge.getID())
             result.append(reverse_edge)
         return result
+
+    def _publish_traffic_target(self) -> None:
+        msg = Int32()
+        msg.data = self._local_traffic_target
+        self._traffic_target_pub.publish(msg)
+
+    def _on_traffic_adjust(self, msg: Int32) -> None:
+        """Traffic up/down buttons in the 3D viewer — scoped to a pool of
+        vehicles near the ego's *current* position, kept separate from the
+        always-on city-wide ambient traffic (_ambient_traffic_count), which
+        this doesn't touch. Raising the target just lets
+        _replenish_local_traffic spawn toward it near the ego over the next
+        few 2-second ticks. Lowering it removes the nearest local_ vehicles
+        to the ego immediately — waiting on them to finish their own trip
+        would make the down button look like it's doing nothing.
+        """
+        new_target = max(0, min(LOCAL_TRAFFIC_MAX, self._local_traffic_target + msg.data))
+        removed = 0
+        if self._sumo_running and new_target < self._local_traffic_target and "ego" in self._traci.vehicle.getIDList():
+            ego_x, ego_y = self._traci.vehicle.getPosition("ego")
+
+            def _dist_to_ego(vid: str) -> float:
+                x, y = self._traci.vehicle.getPosition(vid)
+                return math.hypot(x - ego_x, y - ego_y)
+
+            local_ids = sorted(
+                (v for v in self._traci.vehicle.getIDList() if v.startswith("local_")),
+                key=_dist_to_ego,
+            )
+            excess = len(local_ids) - new_target
+            for vid in local_ids[:max(0, excess)]:
+                try:
+                    self._traci.vehicle.remove(vid)
+                    removed += 1
+                except Exception:
+                    pass   # already gone (finished its trip this same tick) — fine
+
+        self._local_traffic_target = new_target
+        self._publish_traffic_target()
+        self.get_logger().info(
+            f"Local traffic target adjusted to {new_target} (removed {removed})."
+        )
+
+    def _replenish_local_traffic(self) -> None:
+        """Keep a vehicle count near the ego's current position at
+        _local_traffic_target — the pool the viewer's traffic buttons
+        control. Separate from _replenish_ambient_traffic's city-wide pool:
+        this one is recomputed around wherever the ego actually is *right
+        now* each tick, since the ego is continuously moving and "near the
+        car" has to track that, not a fixed area from whenever the target
+        was last raised.
+        """
+        if not self._sumo_running or not self._all_drivable_edges:
+            return
+        vehicle_ids = self._traci.vehicle.getIDList()
+        if "ego" not in vehicle_ids:
+            return
+
+        current = sum(1 for v in vehicle_ids if v.startswith("local_"))
+        to_spawn = min(self._local_traffic_spawn_batch, self._local_traffic_target - current)
+        if to_spawn <= 0:
+            return
+
+        ego_edge_id = self._traci.vehicle.getRoadID("ego")
+        if not ego_edge_id or ego_edge_id.startswith(":"):
+            return   # ego is mid-junction on an internal lane — try again next tick
+        ego_edge = self._net.getEdge(ego_edge_id)
+        nearby_edges = self._nearby_drivable_edges([ego_edge], self._local_traffic_pad_m)
+        if len(nearby_edges) < 2:
+            return
+
+        spawned = 0
+        for _ in range(to_spawn):
+            for _attempt in range(5):
+                origin = random.choice(nearby_edges)
+                dest = random.choice(nearby_edges)
+                if origin.getID() == dest.getID():
+                    continue
+                path, _cost = self._net.getShortestPath(origin, dest, vClass="passenger")
+                if path is None:
+                    continue
+
+                self._local_traffic_counter += 1
+                vid = f"local_{self._local_traffic_counter}"
+                try:
+                    route_id = f"local_route_{self._local_traffic_counter}"
+                    self._traci.route.add(route_id, [e.getID() for e in path])
+                    self._traci.vehicle.add(
+                        vid, route_id, departLane="random", departSpeed="max",
+                    )
+                    self._traci.vehicle.setSpeedMode(vid, 7)
+                    spawned += 1
+                except Exception:
+                    pass
+                break
+
+        if spawned:
+            self.get_logger().info(
+                f"Local traffic replenished — +{spawned}, "
+                f"{current + spawned}/{self._local_traffic_target} near ego."
+            )
 
     def _replenish_ambient_traffic(self) -> None:
         """Keep a steady ambient vehicle count spread across the whole

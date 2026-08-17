@@ -20,7 +20,18 @@ Subscribes
 /navigation/route_buildings  (std_msgs/String)  — JSON building footprints near the same route
 /navigation/route_sidewalks  (std_msgs/String)  — JSON sidewalk ribbon polygons near the same route
 /navigation/traffic_vehicles (std_msgs/String)  — JSON background traffic state, every sim tick
+/navigation/traffic_target   (std_msgs/Int32)   — current *local* traffic target near the ego
+                                                    (the pool the viewer's buttons control, not
+                                                    the city-wide ambient count), published by
+                                                    sumo_bridge whenever it changes
 /vehicle/state                (ads_interfaces/msg/VehicleState)
+
+Publishes
+---------
+/navigation/traffic_adjust (std_msgs/Int32)  — relayed from the 3D viewer's traffic up/down
+                                                 buttons (client -> server, the one direction
+                                                 that isn't just a broadcast) to sumo_bridge,
+                                                 which owns the actual local-traffic count/logic.
 
 Serves
 ------
@@ -33,6 +44,12 @@ ws://0.0.0.0:<ws_port>  — JSON messages, each also sent to a client on connect
   {"type": "sidewalks", "sidewalks": [[[x,y], ...], ...]}
   {"type": "ego", "x":, "y":, "heading":, "speed":}   — sent on every /vehicle/state update
   {"type": "traffic", "vehicles": [{"id":, "x":, "y":, "heading":, "speed":}, ...]}
+  {"type": "traffic_target", "count": N}   — current local-traffic target near the ego
+
+Accepts from client
+--------------------
+  {"type": "traffic_adjust", "delta": N}   — N can be negative; relayed straight to
+                                               /navigation/traffic_adjust
 """
 
 import asyncio
@@ -42,7 +59,7 @@ from typing import Optional
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Int32, String
 
 from ads_interfaces.msg import Route, VehicleState
 
@@ -61,6 +78,7 @@ class Car3DBridge(Node):
         self._buildings_json: Optional[str] = None
         self._sidewalks_json: Optional[str] = None
         self._traffic_json: Optional[str] = None
+        self._traffic_target_json: Optional[str] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Recenter on the route's own start point rather than any city-wide
         # reference — keeps scene coordinates small regardless of where in
@@ -73,6 +91,9 @@ class Car3DBridge(Node):
         self.create_subscription(String, "/navigation/route_buildings", self._on_route_buildings, 10)
         self.create_subscription(String, "/navigation/route_sidewalks", self._on_route_sidewalks, 10)
         self.create_subscription(String, "/navigation/traffic_vehicles", self._on_traffic_vehicles, 10)
+        self.create_subscription(Int32, "/navigation/traffic_target", self._on_traffic_target, 10)
+
+        self._traffic_adjust_pub = self.create_publisher(Int32, "/navigation/traffic_adjust", 10)
 
         threading.Thread(target=self._run_ws_server, daemon=True).start()
 
@@ -172,6 +193,11 @@ class Car3DBridge(Node):
         if self._loop is not None:
             asyncio.run_coroutine_threadsafe(self._broadcast(self._traffic_json), self._loop)
 
+    def _on_traffic_target(self, msg: Int32) -> None:
+        self._traffic_target_json = json.dumps({"type": "traffic_target", "count": msg.data})
+        if self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._broadcast(self._traffic_target_json), self._loop)
+
     def _on_state(self, msg: VehicleState) -> None:
         if self._loop is None:
             return
@@ -184,6 +210,25 @@ class Car3DBridge(Node):
             "speed": msg.speed,
         })
         asyncio.run_coroutine_threadsafe(self._broadcast(payload), self._loop)
+
+    def _on_client_message(self, raw: str) -> None:
+        """The one direction of traffic that isn't server -> client broadcast:
+        the viewer's traffic up/down buttons send a delta here, which just
+        gets relayed onto /navigation/traffic_adjust — sumo_bridge owns the
+        actual ambient-traffic count and vehicle spawn/remove logic.
+        """
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if data.get("type") != "traffic_adjust":
+            return
+        delta = data.get("delta")
+        if not isinstance(delta, (int, float)):
+            return
+        msg = Int32()
+        msg.data = int(delta)
+        self._traffic_adjust_pub.publish(msg)
 
     async def _broadcast(self, payload: str) -> None:
         if not self._ws_clients:
@@ -219,8 +264,10 @@ class Car3DBridge(Node):
                     await websocket.send(self._sidewalks_json)
                 if self._traffic_json:
                     await websocket.send(self._traffic_json)
-                async for _ in websocket:
-                    pass   # no client -> server messages expected
+                if self._traffic_target_json:
+                    await websocket.send(self._traffic_target_json)
+                async for raw in websocket:
+                    self._on_client_message(raw)
             finally:
                 self._ws_clients.discard(websocket)
                 self.get_logger().info(f"3D viewer disconnected ({len(self._ws_clients)} total).")
