@@ -359,7 +359,10 @@ function drawJunctions(junctions) {
 // height), not below it, so this is the lane surface height (0.5) plus a
 // ~15cm curb rise, rather than just clearing the ground plane.
 const SIDEWALK_HEIGHT = 0.65;
-const sidewalkMat = new THREE.MeshStandardMaterial({ color: 0x9c9284, side: THREE.DoubleSide });
+// Concrete grey — between the road's dark asphalt (laneSurfaceMat is
+// 0x33383f) and pale — distinguishable from the road by shade, not a
+// differently colored material like the earlier tan.
+const sidewalkMat = new THREE.MeshStandardMaterial({ color: 0x5c626b, side: THREE.DoubleSide });
 
 function buildSidewalkPatch(shapePts) {
   const shape = new THREE.Shape(shapePts.map((p) => new THREE.Vector2(p.x, -p.z)));
